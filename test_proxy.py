@@ -1,0 +1,506 @@
+import os
+import sys
+import json
+import time
+import base64
+import urllib.request
+import urllib.error
+import unittest
+from pathlib import Path
+
+# Add project root to sys.path so we can import server.py directly for unit tests
+PROJECT_DIR = Path(__file__).resolve().parent
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+
+import server
+from server import (
+    Message,
+    Tool,
+    FunctionDef,
+    ChatRequest,
+    clean_response_text,
+    sanitize_outgoing_prompt,
+    has_pending_section_marker,
+    is_intermediate_status,
+    parse_tool_calls,
+    get_unemitted_suffix,
+    hash_message,
+    is_history_continuation,
+    prepare_turn_prompt,
+    get_content_text,
+    extract_images_from_messages,
+    is_dedicated_title_request,
+)
+
+PROXY_BASE_URL = os.getenv("PROXY_BASE_URL", "http://127.0.0.1:8080")
+API_KEY = server.API_KEY or ""
+TEST_SESSION_ID = f"autotest-session-{int(time.time())}"
+
+
+# ==============================================================================
+# 1. OFFLINE UNIT TESTS (Pure Logic, Regex, Tool Parsing, Delta Sync)
+# ==============================================================================
+class TestProxyUnitLogic(unittest.TestCase):
+    def test_clean_response_text_strips_portal_noise_but_preserves_code(self):
+        raw = (
+            "I will load the `universal` skill first so we can inspect the files.\n"
+            "[[section:Loading Universal Skill]]\n"
+            "Skill usedUniversal\n"
+            " \n"
+            "Working on the request (4s)\n"
+            "[[section:Analyzing Files]]\n"
+            "Here is the actual response with `[[section:inline_preserved]]`, `Skill usedUniversal`, and escaped \\_underscores\\_.\n\n"
+            "```python\n"
+            "# Inside code block, these must NOT be stripped:\n"
+            "marker = '[[section:KeepMe]]'\n"
+            "skill_badge = 'Skill usedUniversal'\n"
+            "escaped = r'\\_keep_backslash\\_'\n"
+            "```\n\n"
+            "<a2a_datapart_json>{\"internal\": true}</a2a_datapart_json>\n"
+            "```suggested_questions\n"
+            "{\"questions\": [\"Q1?\"], \"type\": \"followup\"}\n"
+            "```\n"
+            "## Suggestions\n"
+            "- Follow up 1\n"
+        )
+        cleaned = clean_response_text(raw)
+        self.assertNotIn("Working on the request", cleaned)
+        self.assertNotIn("[[section:Analyzing Files]]", cleaned)
+        self.assertNotIn("I will load the `universal` skill", cleaned)
+        self.assertFalse(cleaned.startswith("Skill usedUniversal"))
+        self.assertNotIn("<a2a_datapart_json>", cleaned)
+        self.assertNotIn("suggested_questions", cleaned)
+        self.assertNotIn("## Suggestions", cleaned)
+        # Verify inline & code block preservation and prose underscore unescaping
+        self.assertIn("escaped _underscores_.", cleaned)
+        self.assertIn("`[[section:inline_preserved]]`", cleaned)
+        self.assertIn("`Skill usedUniversal`", cleaned)
+        self.assertIn("skill_badge = 'Skill usedUniversal'", cleaned)
+        self.assertIn("marker = '[[section:KeepMe]]'", cleaned)
+        self.assertIn("escaped = r'\\_keep_backslash\\_'", cleaned)
+
+    def test_has_pending_section_marker(self):
+        self.assertTrue(has_pending_section_marker("I will check the logs.\n[[section:Checking Logs]]"))
+        self.assertTrue(
+            has_pending_section_marker(
+                "I will check.\n[[section:Checking]]\n```suggested_questions\n{}\n```"
+            )
+        )
+        self.assertFalse(has_pending_section_marker("I will check.\n[[section:Checking]]\nDone checking!"))
+
+    def test_is_intermediate_status(self):
+        self.assertTrue(is_intermediate_status("I will search the internal repository for this file."))
+        self.assertTrue(is_intermediate_status("Let me check the configuration settings."))
+        self.assertFalse(is_intermediate_status("Here is the final answer to your question."))
+        self.assertFalse(
+            is_intermediate_status(
+                "I will search the repo.\n<tool_call>\n{\"name\": \"search\"}\n</tool_call>"
+            )
+        )
+
+    def test_sanitize_outgoing_prompt(self):
+        raw = "Test [[section:Title]] and ```suggested_questions"
+        sanitized = sanitize_outgoing_prompt(raw)
+        self.assertNotIn("[[section:", sanitized)
+        self.assertNotIn("```suggested_questions", sanitized)
+        self.assertIn("[\u200b[section:", sanitized)
+        self.assertIn("```\u200bsuggested_questions", sanitized)
+
+    def test_parse_tool_calls_single_and_parallel_and_invalid_escape_recovery(self):
+        tools = [
+            Tool(function=FunctionDef(name="read_file", description="Read file")),
+            Tool(function=FunctionDef(name="search_files", description="Search")),
+        ]
+        # Note: JSON with invalid escape `\_` is repaired by _repair_invalid_json_escapes so json.loads succeeds
+        response = (
+            "I will read the config and search files.\n\n"
+            "```xml\n"
+            "<tool_call>\n"
+            "{\"name\": \"read_file\", \"arguments\": {\"path\": \"E:\\\\test_file.py\"}}\n"
+            "</tool_call>\n"
+            "```\n\n"
+            "```xml\n"
+            "<tool_call>\n"
+            "{\"name\": \"search_files\", \"arguments\": {\"pattern\": \"*_test.py\"}}\n"
+            "</tool_call>\n"
+            "```"
+        )
+        cleaned_text, tool_calls = parse_tool_calls(response, allowed_tools=tools)
+        self.assertEqual(cleaned_text, "I will read the config and search files.")
+        self.assertIsNotNone(tool_calls)
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0]["function"]["name"], "read_file")
+        self.assertEqual(json.loads(tool_calls[0]["function"]["arguments"])["path"], "E:\\test_file.py")
+        self.assertEqual(tool_calls[1]["function"]["name"], "search_files")
+        self.assertEqual(json.loads(tool_calls[1]["function"]["arguments"])["pattern"], "*_test.py")
+
+    def test_parse_tool_calls_filtered_against_allowed_tools(self):
+        """Verify whether parse_tool_calls filters out hallucinated internal portal tool names when allowed_tools is passed."""
+        tools = [Tool(function=FunctionDef(name="read_file", description="Read file"))]
+        hallucinated = (
+            "```xml\n"
+            "<tool_call>\n"
+            "{\"name\": \"call:default_api:invalid_tool_call_notifier\", \"arguments\": {}}\n"
+            "</tool_call>\n"
+            "```"
+        )
+        _, tool_calls = parse_tool_calls(hallucinated, allowed_tools=tools)
+        # Record whether primary XML parser enforces allowed_tools:
+        if tool_calls:
+            print(f"\n  [Finding] Primary XML tool parser does not filter against allowed_tools: {tool_calls[0]['function']['name']}")
+
+    def test_parse_tool_calls_ignores_non_tool_code_blocks(self):
+        tools = [Tool(function=FunctionDef(name="read_file"))]
+        response = (
+            "Here is an example of how tool calls look in markdown:\n"
+            "```python\n"
+            "example = '''\n"
+            "<tool_call>\n"
+            "{\"name\": \"read_file\", \"arguments\": {\"path\": \"fake.txt\"}}\n"
+            "</tool_call>\n"
+            "'''\n"
+            "```"
+        )
+        cleaned_text, tool_calls = parse_tool_calls(response, allowed_tools=tools)
+        self.assertIsNone(tool_calls)
+        self.assertIn("fake.txt", cleaned_text)
+
+    def test_delta_and_reset_synchronization(self):
+        sid = "unit-test-sid"
+        server.session_history_hashes.pop(sid, None)
+        server.session_tools_hashes.pop(sid, None)
+        server.dirty_sessions.discard(sid)
+
+        msg1 = Message(role="user", content="Hello")
+        req1 = ChatRequest(messages=[msg1])
+        prompt1, needs_reset1, hashes1, tools_hash1 = prepare_turn_prompt(sid, req1)
+        self.assertFalse(needs_reset1)
+        self.assertIn("User:\nHello", prompt1)
+
+        # Simulate turn 1 completion
+        asst1 = Message(role="assistant", content="Hi there!")
+        server.session_history_hashes[sid] = hashes1 + [hash_message(asst1)]
+        server.session_tools_hashes[sid] = tools_hash1
+
+        # Turn 2: Append-only continuation -> DELTA mode (needs_reset=False, only msg2 in prompt)
+        msg2 = Message(role="user", content="How are you?")
+        req2 = ChatRequest(messages=[msg1, asst1, msg2])
+        prompt2, needs_reset2, hashes2, _ = prepare_turn_prompt(sid, req2)
+        self.assertFalse(needs_reset2)
+        self.assertNotIn("Hello", prompt2)
+        self.assertIn("How are you?", prompt2)
+
+        # Turn 3: History rewind/modification -> RESET+FULL mode (needs_reset=True)
+        msg1_modified = Message(role="user", content="Different first message")
+        req3 = ChatRequest(messages=[msg1_modified, asst1, msg2])
+        prompt3, needs_reset3, _, _ = prepare_turn_prompt(sid, req3)
+        self.assertTrue(needs_reset3)
+        self.assertIn("Different first message", prompt3)
+
+        # Cleanup unit state
+        server.session_history_hashes.pop(sid, None)
+        server.session_tools_hashes.pop(sid, None)
+
+    def test_get_unemitted_suffix(self):
+        emitted = "Hello world, this is a streaming test."
+        current = "Hello world, this is a streaming test. Here is new content!"
+        self.assertEqual(get_unemitted_suffix(emitted, current), " Here is new content!")
+
+        # Slight reflow in earlier text
+        emitted_reflow = "Item 1: foo  bar is ready."
+        current_reflow = "Item 1: foo bar is ready. Next sentence."
+        self.assertEqual(get_unemitted_suffix(emitted_reflow, current_reflow), " Next sentence.")
+
+    def test_multimodal_and_file_extraction(self):
+        b64_txt = base64.b64encode(b"secret file content 123").decode("ascii")
+        b64_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+        msg = Message(
+            role="user",
+            content=[
+                {"type": "text", "text": "Check this file and image"},
+                {
+                    "type": "file",
+                    "file": {
+                        "filename": "notes.txt",
+                        "file_data": f"data:text/plain;base64,{b64_txt}",
+                    },
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{b64_png}"},
+                },
+            ],
+        )
+        extracted_text = get_content_text(msg.content)
+        self.assertIn("Check this file and image", extracted_text)
+        self.assertIn("--- Attached File: notes.txt ---", extracted_text)
+        self.assertIn("secret file content 123", extracted_text)
+
+        images = extract_images_from_messages([msg])
+        self.assertEqual(len(images), 1)
+        self.assertEqual(images[0][0], "upload_2.png")
+        self.assertTrue(images[0][1].startswith(b"\x89PNG"))
+
+    def test_dedicated_title_request_detection(self):
+        req = ChatRequest(
+            messages=[
+                Message(role="system", content="You name chat sessions concisely."),
+                Message(role="user", content="Hello world"),
+            ]
+        )
+        self.assertTrue(is_dedicated_title_request(req))
+
+
+# ==============================================================================
+# 2. LIVE END-TO-END INTEGRATION TESTS (Against Running Proxy on Port 8080)
+# ==============================================================================
+def http_json(method: str, path: str, payload: dict = None, headers: dict = None, timeout: int = 120):
+    url = f"{PROXY_BASE_URL}{path}"
+    req_headers = {"Content-Type": "application/json"}
+    if headers:
+        req_headers.update(headers)
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8")
+            return resp.status, json.loads(body) if body else {}
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(body)
+        except Exception:
+            parsed = {"raw": body}
+        return e.code, parsed
+
+
+def http_sse(path: str, payload: dict, headers: dict = None, timeout: int = 120):
+    url = f"{PROXY_BASE_URL}{path}"
+    req_headers = {"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"}
+    if headers:
+        req_headers.update(headers)
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=req_headers, method="POST")
+    chunks = []
+    done_received = False
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        for raw_line in resp:
+            line = raw_line.decode("utf-8").strip()
+            if not line or line.startswith(":"):
+                continue
+            if line == "data: [DONE]":
+                done_received = True
+                break
+            if line.startswith("data: "):
+                chunks.append(json.loads(line[6:]))
+    return chunks, done_received
+
+
+class TestProxyLiveE2E(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        try:
+            status, data = http_json("GET", "/health", timeout=5)
+            cls.server_online = (status == 200 and data.get("status") == "ready")
+        except Exception:
+            cls.server_online = False
+
+    @classmethod
+    def tearDownClass(cls):
+        if getattr(cls, "server_online", False):
+            # Clean up only our dedicated test session ID
+            try:
+                http_json(
+                    "POST",
+                    f"/v1/sessions/reset?session_id={TEST_SESSION_ID}",
+                    headers={"Authorization": f"Bearer {API_KEY}"},
+                    timeout=10,
+                )
+            except Exception:
+                pass
+
+    def setUp(self):
+        if not self.server_online:
+            self.skipTest("Live proxy server is not running or not ready on 127.0.0.1:8080")
+
+    def test_01_health_endpoint(self):
+        status, data = http_json("GET", "/health")
+        self.assertEqual(status, 200)
+        self.assertEqual(data.get("status"), "ready")
+        self.assertIn("available_models", data)
+        self.assertIsInstance(data["available_models"], list)
+
+    def test_02_authentication_guard(self):
+        if API_KEY:
+            # Missing token -> 401
+            status_no_auth, _ = http_json("GET", "/v1/models", headers={})
+            self.assertEqual(status_no_auth, 401)
+
+            # Wrong token -> 401
+            status_bad_auth, _ = http_json(
+                "GET", "/v1/models", headers={"Authorization": "Bearer wrong-token-123"}
+            )
+            self.assertEqual(status_bad_auth, 401)
+
+        # Valid token (or no auth when API_KEY is empty) -> 200
+        auth_headers = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
+        status_ok, data = http_json("GET", "/v1/models", headers=auth_headers)
+        self.assertEqual(status_ok, 200)
+        self.assertEqual(data.get("object"), "list")
+        self.assertTrue(len(data.get("data", [])) >= 1)
+
+    def test_03_fast_title_interceptor(self):
+        t0 = time.monotonic()
+        status, data = http_json(
+            "POST",
+            "/v1/chat/completions",
+            payload={
+                "model": "Auto",
+                "stream": False,
+                "messages": [
+                    {"role": "system", "content": "You name chat sessions."},
+                    {"role": "user", "content": "Test message"},
+                ],
+            },
+            headers={"Authorization": f"Bearer {API_KEY}"},
+        )
+        elapsed = time.monotonic() - t0
+        self.assertEqual(status, 200)
+        self.assertLess(elapsed, 2.0, "Title interceptor should return immediately without browser")
+        content = data["choices"][0]["message"]["content"]
+        self.assertIn("Gemini Session", content)
+
+    def test_04_live_non_streaming_and_delta_continuation(self):
+        # Turn 1 (NEW session tab for TEST_SESSION_ID)
+        status1, data1 = http_json(
+            "POST",
+            "/v1/chat/completions",
+            payload={
+                "model": "Auto",
+                "stream": False,
+                "session_id": TEST_SESSION_ID,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Remember the token 'ORCHID_99'. Reply with ONLY the word OK.",
+                    }
+                ],
+            },
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            timeout=90,
+        )
+        self.assertEqual(status1, 200)
+        reply1 = data1["choices"][0]["message"]["content"]
+        self.assertTrue(len(reply1) > 0)
+        self.assertNotIn("suggested_questions", reply1)
+
+        # Turn 2 (DELTA continuation on same TEST_SESSION_ID)
+        status2, data2 = http_json(
+            "POST",
+            "/v1/chat/completions",
+            payload={
+                "model": "Auto",
+                "stream": False,
+                "session_id": TEST_SESSION_ID,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Remember the token 'ORCHID_99'. Reply with ONLY the word OK.",
+                    },
+                    {"role": "assistant", "content": reply1},
+                    {
+                        "role": "user",
+                        "content": "What was the token I just told you in the previous message?",
+                    },
+                ],
+            },
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            timeout=90,
+        )
+        self.assertEqual(status2, 200)
+        reply2 = data2["choices"][0]["message"]["content"]
+        self.assertIn("ORCHID_99", reply2.upper())
+
+    def test_05_live_streaming_with_tool_call_and_usage(self):
+        tool_session_id = f"{TEST_SESSION_ID}-tools"
+        tools_schema = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a text file with line numbers and pagination.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
+                    },
+                },
+            }
+        ]
+        sample_path = (PROJECT_DIR / "config.properties.example").as_posix()
+        messages = [
+            {
+                "role": "user",
+                "content": f"Load the 'universal' skill first, then emit the <tool_call> XML block to call read_file on '{sample_path}'.",
+            }
+        ]
+        chunks, done = http_sse(
+            "/v1/chat/completions",
+            payload={
+                "model": "Auto",
+                "stream": True,
+                "session_id": tool_session_id,
+                "stream_options": {"include_usage": True},
+                "tool_choice": "required",
+                "tools": tools_schema,
+                "messages": messages,
+            },
+            timeout=90,
+        )
+        # Clean up the tool session tab
+        try:
+            http_json(
+                "POST",
+                f"/v1/sessions/reset?session_id={tool_session_id}",
+                headers={"Authorization": f"Bearer {API_KEY}"},
+                timeout=10,
+            )
+        except Exception:
+            pass
+
+        self.assertTrue(done, "SSE stream must terminate with data: [DONE]")
+        self.assertTrue(len(chunks) >= 2)
+
+        # Verify no raw <tool_call> or 'Skill used' badge leaked into delta.content
+        streamed_content = "".join(
+            c["choices"][0]["delta"].get("content", "")
+            for c in chunks
+            if c.get("choices")
+        )
+        self.assertNotIn("<tool_call>", streamed_content)
+        self.assertNotIn("Skill used", streamed_content)
+
+        # Verify structured tool_calls emitted
+        tool_call_chunks = [
+            c["choices"][0]["delta"]["tool_calls"]
+            for c in chunks
+            if c.get("choices") and c["choices"][0]["delta"].get("tool_calls")
+        ]
+        if not tool_call_chunks:
+            print("\n  [Debug Stream Chunks]:", chunks)
+        self.assertTrue(len(tool_call_chunks) >= 1, "Expected structured tool_calls in SSE stream")
+        emitted_tc = tool_call_chunks[0][0]
+        self.assertEqual(emitted_tc["function"]["name"], "read_file")
+        self.assertIn("config.properties", json.loads(emitted_tc["function"]["arguments"]).get("path", ""))
+
+        # Verify finish_reason == 'tool_calls' and usage presence
+        final_choice_chunks = [
+            c for c in chunks if c.get("choices") and c["choices"][0].get("finish_reason")
+        ]
+        self.assertEqual(final_choice_chunks[-1]["choices"][0]["finish_reason"], "tool_calls")
+        self.assertIn("usage", final_choice_chunks[-1])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

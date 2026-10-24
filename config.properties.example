@@ -1,0 +1,5 @@
+# Target Gemini Enterprise / Vertex AI Agentspace Web Portal URL
+TARGET_URL=https://gemini.google.com
+
+# Optional Bearer API Key for /v1/* endpoints (leave empty for no auth on 127.0.0.1)
+API_KEY=

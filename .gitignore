@@ -1,0 +1,74 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+*.pid
+
+# Chrome/Browser data
+.chrome-session/
+chrome-profile/
+
+# Service data
+.gemini-service/
+config.properties
+server.txt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+test_*.py
+!test_proxy.py
+*_test.py
+testing/
+
+# Temporary files
+*.tmp
+*.temp
+
+# Playwright
+node_modules/
+/tests
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+/playwright/.auth/
+playwright.config.js
+
+# Packages
+package-lock.json
+package.json
