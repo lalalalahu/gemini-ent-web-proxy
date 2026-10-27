@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 from playwright_stealth import Stealth
 from fastapi import FastAPI, HTTPException, Depends, Request, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 from playwright.async_api import async_playwright, Page, BrowserContext
 
@@ -27,11 +27,13 @@ AVAILABLE_MODELS = ["Auto"]
 
 DATA_DIR = Path.home() / ".gemini-service"
 PROFILE_DIR = DATA_DIR / "chrome-profile"
+IMAGE_DIR = DATA_DIR / "images"
 LOGIN_FLAG = DATA_DIR / "logged-in"
 BASE_DIR = Path(__file__).resolve().parent
 PROPERTIES_FILE = BASE_DIR / "config.properties"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 load_dotenv(dotenv_path=PROPERTIES_FILE, override=True)
 
@@ -84,14 +86,22 @@ is_ready = False
 
 MAX_OPEN_TABS = int(os.getenv("MAX_OPEN_TABS", "10"))
 SESSION_IDLE_TTL_SECONDS = float(os.getenv("SESSION_IDLE_TTL_SECONDS", "900"))  # 15 mins
+IMAGE_TTL_SECONDS = float(os.getenv("IMAGE_TTL_SECONDS", "86400"))  # 24 hours
+REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "300"))  # 5 mins
+MAX_FULL_SYNC_CHARS = int(os.getenv("MAX_FULL_SYNC_CHARS", "75000"))
+MAX_SINGLE_TOOL_CHARS = int(os.getenv("MAX_SINGLE_TOOL_CHARS", "30000"))
 
-# Tuned timers: Resistant to mid-stream pauses on long 10-point responses
+# Tuned timers: Resistant to mid-stream pauses on long 10-point responses and image generation
 INITIAL_RESPONSE_GRACE_SECONDS = float(os.getenv("INITIAL_RESPONSE_GRACE_SECONDS", "2.0"))
 INTERMEDIATE_STATUS_GRACE_SECONDS = float(os.getenv("INTERMEDIATE_STATUS_GRACE_SECONDS", "45.0"))
 FINAL_RESPONSE_QUIET_SECONDS = float(os.getenv("FINAL_RESPONSE_QUIET_SECONDS", "3.5"))
 
 INTERMEDIATE_STATUS_RE = re.compile(
     r"^\s*(?:i(?:'ll| will)|let me)\s+(?:load|activate|enable|search|check|look(?:\s+up)?|retrieve|gather|analy[sz]e|inspect|examine|read|review|query|find)\b",
+    re.IGNORECASE,
+)
+IMAGE_CAPTION_ANNOUNCE_RE = re.compile(
+    r"(?:image\s+generated\s+by|generating\s+image|creating\s+image)",
     re.IGNORECASE,
 )
 
@@ -111,13 +121,25 @@ LINE_XML_TOOL_CALL_RE = re.compile(
     re.IGNORECASE,
 )
 PROTECTED_BLOCKS_RE = re.compile(
-    r"(`{3,}[\s\S]*?`{3,}|^[ \t]*<tool_call\b[\s\S]*?^[ \t]*</tool_call>[ \t]*$|`+[^`\n]+`+)",
+    r"((`{3,})[\s\S]*?\2|^[ \t]*<tool_call\b[\s\S]*?^[ \t]*</tool_call>[ \t]*$|(`+)[^`\n]+\3)",
     re.IGNORECASE | re.MULTILINE,
 )
 NON_TOOL_CODE_BLOCK_RE = re.compile(
-    r"(`{3,}(?!(?:xml|json|tool_call)\b)[a-zA-Z0-9_+-]+[ \t]*\r?\n[\s\S]*?`{3,}|`+[^`\n]+`+)",
+    r"((`{3,})(?!(?:xml|json|tool_call)\b)[a-zA-Z0-9_+-]+[^\n]*\n[\s\S]*?\2|(`+)[^`\n]+\3)",
     re.IGNORECASE,
 )
+INTERNAL_PORTAL_TOOLS = {
+    "transfer_to_agent",
+    "load_skill",
+    "load_skill_resource",
+    "list_skills",
+    "google_search_tool",
+    "search_support_docs",
+    "get_environment_status",
+    "generate_memories",
+    "invalid_tool_call_notifier",
+    "tool_name",
+}
 DATAPART_JSON_RE = re.compile(
     r"(?<!`)<a2a_datapart_json>(?:(?!</?a2a_datapart_json>)[\s\S])*?</a2a_datapart_json>(?!`)",
     re.IGNORECASE,
@@ -158,18 +180,32 @@ def is_intermediate_status(text: str) -> bool:
 # SHADOW-DOM-PIERCING STATUS & MARKDOWN EXTRACTOR
 # ==============================================================================
 JS_STATUS_AND_EXTRACTOR = """(turnEl) => {
-    // Deep Shadow-DOM query helper so Stop buttons and busy indicators inside ucs-* shadow roots are never missed
+    // Deep Shadow-DOM + Slot + same-origin Iframe query helper so elements inside ucs-* shadow roots are never missed
     function querySelectorAllDeep(root, selector) {
         const results = [];
+        const visited = new Set();
         function walk(node) {
-            if (!node) return;
+            if (!node || visited.has(node)) return;
+            visited.add(node);
             if (node.nodeType === Node.ELEMENT_NODE || node.nodeType === Node.DOCUMENT_NODE || node.nodeType === Node.DOCUMENT_FRAGMENT_NODE) {
                 if (node.querySelectorAll) {
                     try {
-                        node.querySelectorAll(selector).forEach(el => results.push(el));
+                        node.querySelectorAll(selector).forEach(el => {
+                            if (!results.includes(el)) results.push(el);
+                        });
                     } catch (e) {}
                 }
                 if (node.shadowRoot) walk(node.shadowRoot);
+                if (node.tagName && node.tagName.toLowerCase() === 'slot' && typeof node.assignedNodes === 'function') {
+                    try {
+                        node.assignedNodes({ flatten: true }).forEach(n => walk(n));
+                    } catch (e) {}
+                }
+                if (node.tagName && node.tagName.toLowerCase() === 'iframe') {
+                    try {
+                        if (node.contentDocument) walk(node.contentDocument);
+                    } catch (e) {}
+                }
                 if (node.children) {
                     for (let child of node.children) walk(child);
                 }
@@ -398,19 +434,27 @@ JS_STATUS_AND_EXTRACTOR = """(turnEl) => {
     }
 
     let rawText = "";
+    const seenBlocks = new Set();
+    function appendUniqueBlock(md) {
+        const trimmed = (md || '').trim();
+        if (!trimmed) return;
+        if (seenBlocks.has(trimmed)) return;
+        seenBlocks.add(trimmed);
+        rawText += trimmed + nl + nl;
+    }
     // Collect top-level summary / streamer blocks across light and shadow DOM inside turnEl
     const summaries = filterTopLevelNodes(
         querySelectorAllDeep(turnEl, 'ucs-summary, .summary, [data-message-author-role="assistant"]')
     );
     if (summaries.length > 0) {
         summaries.forEach(s => {
-            rawText += getDeepMarkdown(s) + nl;
+            appendUniqueBlock(getDeepMarkdown(s));
         });
     } else {
         const streamers = filterTopLevelNodes(querySelectorAllDeep(turnEl, 'ucs-text-streamer'));
         if (streamers.length > 0) {
             streamers.forEach(s => {
-                rawText += getDeepMarkdown(s) + nl;
+                appendUniqueBlock(getDeepMarkdown(s));
             });
         } else {
             rawText = getDeepMarkdown(turnEl);
@@ -420,15 +464,392 @@ JS_STATUS_AND_EXTRACTOR = """(turnEl) => {
     const busyElements = querySelectorAllDeep(
         turnEl,
         '[aria-busy="true"], [role="progressbar"], ucs-lottie-animation, .working-on-it-spark'
-    );
+    ).filter(el => el.offsetParent !== null || (typeof el.getClientRects === 'function' && el.getClientRects().length > 0));
+
+    // Detect assistant-generated images/canvas inside turnEl (excluding user-uploaded images, skill/citation badges, and UI icons)
+    const MIN_GEN_IMG_DIM = 200;
+    function isExcludedImageContext(el) {
+        let cur = el;
+        while (cur && cur !== turnEl) {
+            if (cur.nodeType === Node.ELEMENT_NODE) {
+                const c = (typeof cur.className === 'string') ? cur.className.toLowerCase() : '';
+                const t = (cur.tagName || '').toLowerCase();
+                const role = (cur.getAttribute && cur.getAttribute('data-message-author-role')) || '';
+                if (
+                    role === 'user' ||
+                    t.includes('user-query') ||
+                    t.includes('skill') ||
+                    t.includes('citation') ||
+                    t.includes('source') ||
+                    t.includes('suggestion') ||
+                    t.includes('followup') ||
+                    t.includes('thinking') ||
+                    t.includes('icon') ||
+                    t.includes('button') ||
+                    t.includes('chip') ||
+                    [
+                        'question-block', 'question-wrapper', 'user-query', 'user-message',
+                        'skill-used', 'skill-chip', 'skill-badge', 'skill-card', 'skill-invocation', 'skill-header',
+                        'citation', 'source', 'grounding', 'reference', 'chip', 'badge',
+                        'avatar', 'favicon', 'icon', 'logo', 'spark', 'emoji',
+                        'thought-bubble', 'thinking', 'work-status', 'working-on-it', 'diagnostic',
+                        'suggested-question', 'suggestions', 'followup', 'follow-up',
+                        'code-header', 'table-actions', 'toolbar', 'menu'
+                    ].some(k => c.includes(k))
+                ) {
+                    return true;
+                }
+            }
+            cur = cur.parentNode || cur.host;
+        }
+        return false;
+    }
+
+    function isUiIconUrlOrMeta(src, alt, cls) {
+        const s = (src || '').toLowerCase();
+        const a = (alt || '').toLowerCase();
+        const c = (cls || '').toLowerCase();
+        if (s.startsWith('data:image/svg') || s.endsWith('.svg') || s.includes('.svg?')) return true;
+        if (['gstatic.com/images/branding', 'ssl.gstatic.com/ui', 'www.google.com/s2/favicons'].some(p => s.includes(p))) return true;
+        if (['avatar', 'favicon', 'spark', 'emoji', 'icon', 'logo', 'badge', 'skill', 'citation', 'source-icon', 'cloud-icon'].some(k => c.includes(k) || a.includes(k))) return true;
+        return false;
+    }
+
+    const allMedia = querySelectorAllDeep(turnEl, 'img, canvas, [style*="background-image"]');
+    const generatedImgs = [];
+
+    for (const el of allMedia) {
+        if (isExcludedImageContext(el)) continue;
+        const tag = (el.tagName || '').toLowerCase();
+        const rect = (typeof el.getBoundingClientRect === 'function') ? el.getBoundingClientRect() : { width: 0, height: 0 };
+        const cls = (typeof el.className === 'string') ? el.className.toLowerCase() : '';
+
+        if (tag === 'img') {
+            const src = (el.currentSrc || el.getAttribute('src') || el.getAttribute('data-src') || '').trim();
+            const alt = (el.getAttribute('alt') || '').toLowerCase();
+            if (isUiIconUrlOrMeta(src, alt, cls)) continue;
+
+            const nw = el.naturalWidth || 0;
+            const nh = el.naturalHeight || 0;
+            const w = Math.max(nw, rect.width || el.width || 0);
+            const h = Math.max(nh, rect.height || el.height || 0);
+
+            // Reject any loaded image whose natural or rendered dimensions are smaller than MIN_GEN_IMG_DIM (e.g. 64x64 cloud icons)
+            if (el.complete && nw > 0 && nh > 0 && (nw < MIN_GEN_IMG_DIM || nh < MIN_GEN_IMG_DIM)) continue;
+            if (el.complete && (w < MIN_GEN_IMG_DIM || h < MIN_GEN_IMG_DIM)) continue;
+
+            if (!src || !el.complete || nw === 0) {
+                continue;
+            }
+            if (w >= MIN_GEN_IMG_DIM && h >= MIN_GEN_IMG_DIM) {
+                generatedImgs.push({ el, sig: src.slice(0, 48) + ':' + w + 'x' + h });
+            }
+        } else if (tag === 'canvas') {
+            const w = Math.max(el.width || 0, rect.width || 0);
+            const h = Math.max(el.height || 0, rect.height || 0);
+            if (w >= MIN_GEN_IMG_DIM && h >= MIN_GEN_IMG_DIM) {
+                generatedImgs.push({ el, sig: 'canvas:' + w + 'x' + h });
+            }
+        } else {
+            const bg = (el.style && el.style.backgroundImage) || '';
+            if (bg.toLowerCase().includes('url(')) {
+                const bgUrl = bg.replace(/^.*url\\(\\s*["']?/i, '').replace(/["']?\\s*\\).*$/i, '').trim();
+                if (bgUrl && !isUiIconUrlOrMeta(bgUrl, '', cls)) {
+                    const w = rect.width || el.clientWidth || 0;
+                    const h = rect.height || el.clientHeight || 0;
+                    if (w >= MIN_GEN_IMG_DIM && h >= MIN_GEN_IMG_DIM) {
+                        generatedImgs.push({ el, sig: 'bg:' + bgUrl.slice(0, 48) + ':' + w + 'x' + h });
+                    }
+                }
+            }
+        }
+    }
+
+    const imageSignature = generatedImgs.map(item => item.sig).join('|');
+
     const hasActiveWork = busyElements.length > 0;
 
     return {
         isGenerating: hasStop || hasStopIcon,
         hasActiveWork,
         text: rawText,
-        length: rawText.length
+        length: rawText.length,
+        imageCount: generatedImgs.length,
+        imageSignature
     };
+}"""
+
+JS_EXTRACT_TURN_IMAGES = """async (turnEl) => {
+    function querySelectorAllDeep(root, selector) {
+        const results = [];
+        const visited = new Set();
+        function walk(node) {
+            if (!node || visited.has(node)) return;
+            visited.add(node);
+            if (node.nodeType === Node.ELEMENT_NODE || node.nodeType === Node.DOCUMENT_NODE || node.nodeType === Node.DOCUMENT_FRAGMENT_NODE) {
+                if (node.querySelectorAll) {
+                    try {
+                        node.querySelectorAll(selector).forEach(el => {
+                            if (!results.includes(el)) results.push(el);
+                        });
+                    } catch (e) {}
+                }
+                if (node.shadowRoot) walk(node.shadowRoot);
+                if (node.tagName && node.tagName.toLowerCase() === 'slot' && typeof node.assignedNodes === 'function') {
+                    try {
+                        node.assignedNodes({ flatten: true }).forEach(n => walk(n));
+                    } catch (e) {}
+                }
+                if (node.tagName && node.tagName.toLowerCase() === 'iframe') {
+                    try {
+                        if (node.contentDocument) walk(node.contentDocument);
+                    } catch (e) {}
+                }
+                if (node.children) {
+                    for (let child of node.children) walk(child);
+                }
+            }
+        }
+        walk(root);
+        return results;
+    }
+
+    const MIN_GEN_IMG_DIM = 200;
+    function isExcludedImageContext(el) {
+        let cur = el;
+        while (cur && cur !== turnEl) {
+            if (cur.nodeType === Node.ELEMENT_NODE) {
+                const c = (typeof cur.className === 'string') ? cur.className.toLowerCase() : '';
+                const t = (cur.tagName || '').toLowerCase();
+                const role = (cur.getAttribute && cur.getAttribute('data-message-author-role')) || '';
+                if (
+                    role === 'user' ||
+                    t.includes('user-query') ||
+                    t.includes('skill') ||
+                    t.includes('citation') ||
+                    t.includes('source') ||
+                    t.includes('suggestion') ||
+                    t.includes('followup') ||
+                    t.includes('thinking') ||
+                    t.includes('icon') ||
+                    t.includes('button') ||
+                    t.includes('chip') ||
+                    [
+                        'question-block', 'question-wrapper', 'user-query', 'user-message',
+                        'skill-used', 'skill-chip', 'skill-badge', 'skill-card', 'skill-invocation', 'skill-header',
+                        'citation', 'source', 'grounding', 'reference', 'chip', 'badge',
+                        'avatar', 'favicon', 'icon', 'logo', 'spark', 'emoji',
+                        'thought-bubble', 'thinking', 'work-status', 'working-on-it', 'diagnostic',
+                        'suggested-question', 'suggestions', 'followup', 'follow-up',
+                        'code-header', 'table-actions', 'toolbar', 'menu'
+                    ].some(k => c.includes(k))
+                ) {
+                    return true;
+                }
+            }
+            cur = cur.parentNode || cur.host;
+        }
+        return false;
+    }
+
+    function isUiIconUrlOrMeta(src, alt, cls) {
+        const s = (src || '').toLowerCase();
+        const a = (alt || '').toLowerCase();
+        const c = (cls || '').toLowerCase();
+        if (s.startsWith('data:image/svg') || s.endsWith('.svg') || s.includes('.svg?')) return true;
+        if (['gstatic.com/images/branding', 'ssl.gstatic.com/ui', 'www.google.com/s2/favicons'].some(p => s.includes(p))) return true;
+        if (['avatar', 'favicon', 'spark', 'emoji', 'icon', 'logo', 'badge', 'skill', 'citation', 'source-icon', 'cloud-icon'].some(k => c.includes(k) || a.includes(k))) return true;
+        return false;
+    }
+
+    async function blobToDataUrl(blob) {
+        if (!blob || blob.size === 0) return null;
+        return await new Promise((resolve) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(reader.result);
+            reader.onerror = () => resolve(null);
+            reader.readAsDataURL(blob);
+        });
+    }
+
+    async function urlToDataUrl(src) {
+        if (!src) return null;
+        if (src.startsWith('data:image/')) return src;
+        for (const opts of [{ credentials: 'same-origin' }, { credentials: 'include' }, { credentials: 'omit' }]) {
+            try {
+                const resp = await fetch(src, opts);
+                if (resp.ok) {
+                    const blob = await resp.blob();
+                    const dataUrl = await blobToDataUrl(blob);
+                    if (dataUrl && dataUrl.startsWith('data:image/')) return dataUrl;
+                }
+            } catch (e) {}
+        }
+        return null;
+    }
+
+    async function imgToDataUrl(img) {
+        const src = (img.currentSrc || img.src || img.getAttribute('src') || img.getAttribute('data-src') || '').trim();
+        const fetched = await urlToDataUrl(src);
+        if (fetched) return fetched;
+        try {
+            const canvas = document.createElement('canvas');
+            canvas.width = img.naturalWidth || img.width || 512;
+            canvas.height = img.naturalHeight || img.height || 512;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0);
+            return canvas.toDataURL('image/png');
+        } catch (e) {
+            return null;
+        }
+    }
+
+    const allMedia = querySelectorAllDeep(turnEl, 'img, canvas, [style*="background-image"]');
+    const results = [];
+    const seenKeys = new Set();
+    let extractIdx = 0;
+
+    for (const el of allMedia) {
+        if (isExcludedImageContext(el)) continue;
+        const tag = (el.tagName || '').toLowerCase();
+        const rect = (typeof el.getBoundingClientRect === 'function') ? el.getBoundingClientRect() : { width: 0, height: 0 };
+        const cls = (typeof el.className === 'string') ? el.className.toLowerCase() : '';
+
+        if (tag === 'img') {
+            const src = (el.currentSrc || el.getAttribute('src') || el.getAttribute('data-src') || '').trim();
+            if (!src || seenKeys.has(src)) continue;
+            const alt = (el.getAttribute('alt') || '').toLowerCase();
+            if (isUiIconUrlOrMeta(src, alt, cls)) continue;
+
+            const nw = el.naturalWidth || 0;
+            const nh = el.naturalHeight || 0;
+            const w = Math.max(nw, rect.width || el.width || 0);
+            const h = Math.max(nh, rect.height || el.height || 0);
+            if (nw > 0 && nh > 0 && (nw < MIN_GEN_IMG_DIM || nh < MIN_GEN_IMG_DIM)) continue;
+            if (w < MIN_GEN_IMG_DIM || h < MIN_GEN_IMG_DIM) continue;
+
+            seenKeys.add(src);
+            const extractId = 'ge-img-' + (++extractIdx) + '-' + Date.now();
+            try { el.setAttribute('data-ge-extract-id', extractId); } catch (e) {}
+            try { el.scrollIntoView({ block: 'nearest' }); } catch (e) {}
+            const dataUrl = await imgToDataUrl(el);
+            results.push({
+                extractId,
+                tag: 'img',
+                src,
+                dataUrl: (dataUrl && dataUrl.startsWith('data:image/')) ? dataUrl : null,
+                alt: el.getAttribute('alt') || 'Generated Image',
+                width: w,
+                height: h
+            });
+        } else if (tag === 'canvas') {
+            const w = Math.max(el.width || 0, rect.width || 0);
+            const h = Math.max(el.height || 0, rect.height || 0);
+            if (w < MIN_GEN_IMG_DIM || h < MIN_GEN_IMG_DIM) continue;
+            const extractId = 'ge-img-' + (++extractIdx) + '-' + Date.now();
+            try { el.setAttribute('data-ge-extract-id', extractId); } catch (e) {}
+            try { el.scrollIntoView({ block: 'nearest' }); } catch (e) {}
+            let dataUrl = null;
+            try { dataUrl = el.toDataURL('image/png'); } catch (e) {}
+            results.push({
+                extractId,
+                tag: 'canvas',
+                src: '',
+                dataUrl: (dataUrl && dataUrl.startsWith('data:image/')) ? dataUrl : null,
+                alt: 'Generated Image',
+                width: w,
+                height: h
+            });
+        } else {
+            const bg = (el.style && el.style.backgroundImage) || '';
+            if (bg.toLowerCase().includes('url(')) {
+                const src = bg.replace(/^.*url\\(\\s*["']?/i, '').replace(/["']?\\s*\\).*$/i, '').trim();
+                if (src && !isUiIconUrlOrMeta(src, '', cls) && !seenKeys.has(src)) {
+                    const w = rect.width || el.clientWidth || 0;
+                    const h = rect.height || el.clientHeight || 0;
+                    if (w >= MIN_GEN_IMG_DIM && h >= MIN_GEN_IMG_DIM) {
+                        seenKeys.add(src);
+                        const extractId = 'ge-img-' + (++extractIdx) + '-' + Date.now();
+                        try { el.setAttribute('data-ge-extract-id', extractId); } catch (e) {}
+                        try { el.scrollIntoView({ block: 'nearest' }); } catch (e) {}
+                        const dataUrl = await urlToDataUrl(src);
+                        results.push({
+                            extractId,
+                            tag: 'bg',
+                            src,
+                            dataUrl: (dataUrl && dataUrl.startsWith('data:image/')) ? dataUrl : null,
+                            alt: 'Generated Image',
+                            width: w,
+                            height: h
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback scan: if no standard <img>/<canvas> matched, inspect all elements in turnEl for computed background-image or large media containers
+    if (results.length === 0) {
+        const allEls = querySelectorAllDeep(turnEl, '*');
+        for (const el of allEls) {
+            if (isExcludedImageContext(el)) continue;
+            const rect = (typeof el.getBoundingClientRect === 'function') ? el.getBoundingClientRect() : { width: 0, height: 0 };
+            const w = Math.round(rect.width || 0);
+            const h = Math.round(rect.height || 0);
+            if (w < MIN_GEN_IMG_DIM || h < MIN_GEN_IMG_DIM) continue;
+            let csBg = '';
+            try { csBg = (window.getComputedStyle(el).backgroundImage || ''); } catch (e) {}
+            if (csBg && csBg !== 'none' && csBg.toLowerCase().includes('url(')) {
+                const src = csBg.replace(/^.*url\\(\\s*["']?/i, '').replace(/["']?\\s*\\).*$/i, '').trim();
+                if (src && !src.startsWith('data:image/svg') && !src.endsWith('.svg') && !seenKeys.has(src)) {
+                    seenKeys.add(src);
+                    const extractId = 'ge-img-' + (++extractIdx) + '-' + Date.now();
+                    try { el.setAttribute('data-ge-extract-id', extractId); } catch (e) {}
+                    try { el.scrollIntoView({ block: 'nearest' }); } catch (e) {}
+                    const dataUrl = await urlToDataUrl(src);
+                    results.push({
+                        extractId,
+                        tag: 'computed-bg:' + (el.tagName || '').toLowerCase(),
+                        src,
+                        dataUrl: (dataUrl && dataUrl.startsWith('data:image/')) ? dataUrl : null,
+                        alt: 'Generated Image',
+                        width: w,
+                        height: h
+                    });
+                    continue;
+                }
+            }
+            const tag = (el.tagName || '').toLowerCase();
+            const cls = (typeof el.className === 'string') ? el.className.toLowerCase() : '';
+            if (
+                tag.includes('image') ||
+                tag.includes('imagen') ||
+                tag.includes('media') ||
+                tag === 'figure' ||
+                cls.includes('generated-image') ||
+                cls.includes('image-card') ||
+                cls.includes('media-card')
+            ) {
+                const key = tag + ':' + w + 'x' + h;
+                if (!seenKeys.has(key)) {
+                    seenKeys.add(key);
+                    const extractId = 'ge-img-' + (++extractIdx) + '-' + Date.now();
+                    try { el.setAttribute('data-ge-extract-id', extractId); } catch (e) {}
+                    try { el.scrollIntoView({ block: 'nearest' }); } catch (e) {}
+                    results.push({
+                        extractId,
+                        tag: 'container:' + tag,
+                        src: '',
+                        dataUrl: null,
+                        alt: 'Generated Image',
+                        width: w,
+                        height: h
+                    });
+                }
+            }
+        }
+    }
+    return results;
 }"""
 
 
@@ -436,10 +857,14 @@ def _unescape_prose_underscores(text: str) -> str:
     r"""Unescape Markdown `\_` in plain prose while preserving code blocks and `<tool_call>` JSON."""
     if not text or r"\_" not in text:
         return text
-    parts = PROTECTED_BLOCKS_RE.split(text)
-    for i in range(0, len(parts), 2):
-        parts[i] = parts[i].replace(r"\_", "_")
-    return "".join(parts)
+    out = []
+    last_end = 0
+    for m in PROTECTED_BLOCKS_RE.finditer(text):
+        out.append(text[last_end : m.start()].replace(r"\_", "_"))
+        out.append(m.group(0))
+        last_end = m.end()
+    out.append(text[last_end:].replace(r"\_", "_"))
+    return "".join(out)
 
 
 def _clean_unprotected_prose_segment(seg: str) -> str:
@@ -476,14 +901,30 @@ def clean_response_text(raw_text: str) -> str:
     # 1. Strip portal-injected ```suggested_questions blocks at line start
     text = re.sub(r"(?m)^```suggested_questions\b[\s\S]*?^```\s*", "", text, flags=re.IGNORECASE)
     # 2. Clean unprotected prose segments while leaving fenced blocks, inline code, and <tool_call> intact
-    parts = PROTECTED_BLOCKS_RE.split(text)
-    for i in range(0, len(parts), 2):
-        parts[i] = _clean_unprotected_prose_segment(parts[i])
+    segments: List[Tuple[bool, str]] = []
+    last_end = 0
+    for m in PROTECTED_BLOCKS_RE.finditer(text):
+        if m.start() > last_end:
+            segments.append((False, _clean_unprotected_prose_segment(text[last_end : m.start()])))
+        segments.append((True, m.group(0)))
+        last_end = m.end()
+    if last_end < len(text):
+        segments.append((False, _clean_unprotected_prose_segment(text[last_end:])))
     # 3. Strip trailing `# Suggestions` / `## Suggestions` section only when on its own heading line in final prose
-    if parts:
-        parts[-1] = re.sub(r"(?im)(?:\n+|\A)[ \t]*#+\s*suggestions[ \t]*\n[\s\S]*\Z", "", parts[-1])
-    text = "".join(parts)
+    if segments:
+        is_prot, tail_text = segments[-1]
+        if not is_prot:
+            cleaned_tail = re.sub(
+                r"(?im)(?:\n+|\A)[ \t]*#+\s*suggestions[ \t]*\n[\s\S]*\Z",
+                "",
+                tail_text,
+            )
+            segments[-1] = (False, cleaned_tail)
+    text = "".join(seg for _, seg in segments)
+    text = re.sub(r"(?m)^[ \t]+$", "", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
+    # Collapse consecutive identical single-line paragraphs (e.g. duplicate 'Image generated by Nano Banana 2.' captions)
+    text = re.sub(r"(?m)^([^\n`]{3,160})(?:\n[ \t]*)+\1(?=\n|$)", r"\1", text)
     return text.strip()
 
 
@@ -762,6 +1203,7 @@ def format_tools_prompt(
         "",
         "- Always place `<tool_call>` and `</tool_call>` on their own lines.",
         "- Always provide complete, valid JSON arguments matching the tool's parameter schema.",
+        "- Use `<tool_call>` ONLY for the external client tools explicitly listed under `DEFINITIONS OF AVAILABLE TOOLS` below. NEVER wrap built-in portal capabilities or specialist agent handoffs (e.g., `transfer_to_agent`, `imagen_agent`, `videogen_agent`, `load_skill`) in `<tool_call>` tags.",
         "- If a JSON string argument must mention literal `<tool_call>` or `</tool_call>` tags, escape the angle brackets as `\\u003ctool_call\\u003e` and `\\u003c/tool_call\\u003e` (never escape backticks as `\\u0060`; normal backticks are valid inside JSON strings).",
         "- Never output placeholders like `USE_CODE_BLOCK_ABOVE`.",
     ]
@@ -803,7 +1245,7 @@ def build_tool_id_map(messages: List[Message]) -> Dict[str, str]:
     return id_map
 
 
-def format_single_message(msg: Message, tool_id_map: Dict[str, str]) -> str:
+def format_single_message(msg: Message, tool_id_map: Dict[str, str], max_tool_chars: int = MAX_SINGLE_TOOL_CHARS) -> str:
     """Format a single OpenAI message consistently with our `<tool_call>` protocol."""
     role = msg.role
     content = get_content_text(msg.content)
@@ -832,8 +1274,79 @@ def format_single_message(msg: Message, tool_id_map: Dict[str, str]) -> str:
     elif role == "tool":
         tool_name = msg.name or (tool_id_map.get(msg.tool_call_id, "tool") if msg.tool_call_id else "tool")
         id_suffix = f" [call_id: {msg.tool_call_id}]" if msg.tool_call_id else ""
+        if max_tool_chars and len(content) > max_tool_chars:
+            head_len = int(max_tool_chars * 0.75)
+            tail_len = max_tool_chars - head_len
+            omitted = len(content) - max_tool_chars
+            content = (
+                f"{content[:head_len]}\n\n"
+                f"[... {omitted} chars truncated to fit portal single-message size limit ...]\n\n"
+                f"{content[-tail_len:]}"
+            )
         return f"Tool Result ({tool_name}{id_suffix}):\n{content}"
     return f"{role.capitalize()}:\n{content}"
+
+
+def _compact_full_sync_messages(
+    messages: List[Message],
+    tool_id_map: Dict[str, str],
+    header_parts: List[str],
+    footer_parts: List[str],
+    max_total_chars: int = MAX_FULL_SYNC_CHARS,
+) -> List[str]:
+    """
+    Ensure a full-transcript sync (NEW or RESET+FULL) never exceeds the Gemini web portal's
+    single-message character limit (~80k chars), which otherwise triggers:
+    'This request exceeds the size limit. Try starting a new conversation...'
+    """
+    raw_msg_strs = [format_single_message(m, tool_id_map) for m in messages]
+    fixed_len = sum(len(p) + 2 for p in header_parts) + sum(len(p) + 2 for p in footer_parts)
+    total_len = fixed_len + sum(len(s) + 2 for s in raw_msg_strs)
+    if total_len <= max_total_chars:
+        return raw_msg_strs
+
+    # Pass 1: Aggressively compact older tool/assistant messages outside the last 6 messages
+    recent_keep = min(6, len(messages))
+    cutoff = len(messages) - recent_keep
+    compacted_strs = list(raw_msg_strs)
+    for i in range(cutoff):
+        m = messages[i]
+        if m.role not in ("system", "developer") and len(compacted_strs[i]) > 1500:
+            s = compacted_strs[i]
+            compacted_strs[i] = f"{s[:1000]}\n[... {len(s) - 1300} chars compacted ...]\n{s[-300:]}"
+
+    total_len = fixed_len + sum(len(s) + 2 for s in compacted_strs)
+    if total_len <= max_total_chars:
+        return compacted_strs
+
+    # Pass 2: Keep system/developer messages + as many of the most recent messages as fit budget
+    sys_indices = [i for i, m in enumerate(messages) if m.role in ("system", "developer")]
+    other_indices = [i for i, m in enumerate(messages) if m.role not in ("system", "developer")]
+
+    sys_strs = [compacted_strs[i] for i in sys_indices]
+    budget_left = max_total_chars - fixed_len - sum(len(s) + 2 for s in sys_strs) - 160
+
+    kept_tail_rev: List[str] = []
+    for idx in reversed(other_indices):
+        s = compacted_strs[idx]
+        if not kept_tail_rev and len(s) > max(2000, budget_left):
+            # Even the very last message is huge; cap its middle so it fits
+            keep_c = max(2000, budget_left)
+            h_c = int(keep_c * 0.7)
+            t_c = keep_c - h_c
+            s = f"{s[:h_c]}\n\n[... {len(s) - keep_c} chars truncated to fit portal limit ...]\n\n{s[-t_c:]}"
+        if len(s) + 2 <= budget_left or not kept_tail_rev:
+            kept_tail_rev.append(s)
+            budget_left -= len(s) + 2
+        else:
+            break
+
+    kept_tail = list(reversed(kept_tail_rev))
+    omitted_count = len(other_indices) - len(kept_tail)
+    if omitted_count > 0:
+        notice = f"[System Note: {omitted_count} earlier conversation turns omitted during tab resync to fit portal message size limit.]"
+        return sys_strs + [notice] + kept_tail
+    return sys_strs + kept_tail
 
 
 def prepare_turn_prompt(
@@ -890,10 +1403,11 @@ def prepare_turn_prompt(
         return sanitize_outgoing_prompt("\n\n".join(formatted_parts)), False, current_hashes, current_tools_hash
 
     needs_reset = len(prev_hashes) > 0 or is_dirty
-    formatted_parts = []
+    header_parts = []
+    footer_parts = []
 
     if req.tools and req.tool_choice != "none":
-        formatted_parts.append(
+        header_parts.append(
             format_tools_prompt(
                 req.tools,
                 tool_choice=req.tool_choice,
@@ -901,11 +1415,11 @@ def prepare_turn_prompt(
             )
         )
 
-    for m in req.messages:
-        formatted_parts.append(format_single_message(m, tool_id_map))
-
     if req.response_format and req.response_format.get("type") == "json_object":
-        formatted_parts.append("CRITICAL: Respond with ONLY valid JSON matching the requested schema. Do not wrap in markdown code blocks.")
+        footer_parts.append("CRITICAL: Respond with ONLY valid JSON matching the requested schema. Do not wrap in markdown code blocks.")
+
+    msg_parts = _compact_full_sync_messages(req.messages, tool_id_map, header_parts, footer_parts)
+    formatted_parts = header_parts + msg_parts + footer_parts
 
     return sanitize_outgoing_prompt("\n\n".join(formatted_parts)), needs_reset, current_hashes, current_tools_hash
 
@@ -968,13 +1482,30 @@ def parse_tool_calls(response: str, allowed_tools: Optional[List[Tool]] = None) 
             inner_raw = cleaned[m.start(1) : m.end(1)]
             parsed = _try_parse_json_object(inner_raw)
             if isinstance(parsed, dict) and "name" in parsed:
-                raw_tools.append(parsed)
-                ranges_to_remove.append(m.span())
+                tname = str(parsed.get("name", "")).strip()
+                is_internal = tname in INTERNAL_PORTAL_TOOLS or tname.startswith("call:")
+                if not is_internal and (not allowed_names or tname in allowed_names):
+                    raw_tools.append(parsed)
+                    ranges_to_remove.append(m.span())
+                elif is_internal:
+                    # Strip accidental portal-internal <tool_call> blocks from assistant prose
+                    ranges_to_remove.append(m.span())
             elif isinstance(parsed, list):
+                valid_items = []
+                any_internal = False
                 for item in parsed:
                     if isinstance(item, dict) and "name" in item:
-                        raw_tools.append(item)
-                ranges_to_remove.append(m.span())
+                        tname = str(item.get("name", "")).strip()
+                        is_internal = tname in INTERNAL_PORTAL_TOOLS or tname.startswith("call:")
+                        if is_internal:
+                            any_internal = True
+                        elif not allowed_names or tname in allowed_names:
+                            valid_items.append(item)
+                if valid_items:
+                    raw_tools.extend(valid_items)
+                    ranges_to_remove.append(m.span())
+                elif any_internal:
+                    ranges_to_remove.append(m.span())
 
         for start, end in reversed(ranges_to_remove):
             cleaned = cleaned[:start] + cleaned[end:]
@@ -1003,7 +1534,10 @@ def parse_tool_calls(response: str, allowed_tools: Optional[List[Tool]] = None) 
         if isinstance(parsed, dict) and isinstance(parsed.get("tool_calls"), list):
             for tc in parsed["tool_calls"]:
                 if isinstance(tc, dict) and "name" in tc:
-                    raw_tools.append(tc)
+                    tname = str(tc.get("name", "")).strip()
+                    is_internal = tname in INTERNAL_PORTAL_TOOLS or tname.startswith("call:")
+                    if not is_internal and (not allowed_names or tname in allowed_names):
+                        raw_tools.append(tc)
             if raw_tools:
                 cleaned = ""
 
@@ -1064,8 +1598,29 @@ async def check_logged_in(page: Page, timeout: int = 5000) -> bool:
         return False
 
 
+def is_browser_closed_error(exc: BaseException) -> bool:
+    """Return True if an exception indicates the Playwright driver, browser, context, or page is closed."""
+    msg = str(exc).lower()
+    return any(
+        marker in msg
+        for marker in (
+            "connection closed",
+            "target page, context or browser has been closed",
+            "browser has been closed",
+            "context or browser has been closed",
+            "targetclosederror",
+            "target closed",
+            "socket.send() raised exception",
+            "pipe is being closed",
+            "broken pipe",
+        )
+    )
+
+
 async def stop_active_generation(page: Page):
     """Click the Stop button in the UI (piercing Shadow DOM) if a client disconnects mid-generation."""
+    if not is_ready or context is None or page is None or page.is_closed():
+        return
     try:
         await page.evaluate(
             """() => {
@@ -1201,6 +1756,15 @@ async def cleanup_idle_sessions_loop():
                     if page and not page.is_closed():
                         print(f"🧹 [Cleanup] Evicting LRU session tab: {sid[-8:]}", flush=True)
                         await page.close()
+
+            # Purge cached generated images older than IMAGE_TTL_SECONDS
+            now_wall = time.time()
+            for img_file in IMAGE_DIR.glob("img_*"):
+                try:
+                    if (now_wall - img_file.stat().st_mtime) > IMAGE_TTL_SECONDS:
+                        img_file.unlink(missing_ok=True)
+                except Exception:
+                    pass
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -1588,6 +2152,235 @@ async def submit_prompt_to_ui(
 # ==============================================================================
 # CORE EXTRACTION & REAL-TIME STREAMING
 # ==============================================================================
+MIN_GENERATED_IMAGE_BYTES = 4096
+MIN_GENERATED_IMAGE_DIM = 200
+
+
+PNG_MAGIC = bytes.fromhex("89504e470d0a1a0a")
+
+
+def get_image_dimensions(raw_bytes: bytes) -> Optional[Tuple[int, int]]:
+    """Parse width and height from PNG, JPEG, GIF, or WebP headers without external imaging libraries."""
+    if not raw_bytes or len(raw_bytes) < 24:
+        return None
+    # PNG: 8-byte signature + IHDR chunk (width/height at bytes 16..24)
+    if raw_bytes.startswith(PNG_MAGIC) and raw_bytes[12:16] == b"IHDR":
+        w = int.from_bytes(raw_bytes[16:20], "big")
+        h = int.from_bytes(raw_bytes[20:24], "big")
+        return (w, h) if w > 0 and h > 0 else None
+    # GIF: 'GIF87a' or 'GIF89a' (width/height little-endian at bytes 6..10)
+    if raw_bytes[:6] in (b"GIF87a", b"GIF89a"):
+        w = int.from_bytes(raw_bytes[6:8], "little")
+        h = int.from_bytes(raw_bytes[8:10], "little")
+        return (w, h) if w > 0 and h > 0 else None
+    # WebP: RIFF....WEBP
+    if raw_bytes[:4] == b"RIFF" and raw_bytes[8:12] == b"WEBP" and len(raw_bytes) >= 30:
+        chunk = raw_bytes[12:16]
+        if chunk == b"VP8X":
+            w = 1 + int.from_bytes(raw_bytes[24:27], "little")
+            h = 1 + int.from_bytes(raw_bytes[27:30], "little")
+            return (w, h)
+        if chunk == b"VP8 " and len(raw_bytes) >= 30:
+            w = int.from_bytes(raw_bytes[26:28], "little") & 0x3FFF
+            h = int.from_bytes(raw_bytes[28:30], "little") & 0x3FFF
+            return (w, h) if w > 0 and h > 0 else None
+        if chunk == b"VP8L" and len(raw_bytes) >= 25:
+            b0, b1, b2, b3 = raw_bytes[21], raw_bytes[22], raw_bytes[23], raw_bytes[24]
+            w = 1 + (((b1 & 0x3F) << 8) | b0)
+            h = 1 + (((b3 & 0x0F) << 10) | (b2 << 2) | ((b1 & 0xC0) >> 6))
+            return (w, h)
+    # JPEG: scan SOF markers
+    if raw_bytes.startswith(b"\xff\xd8"):
+        idx = 2
+        n = len(raw_bytes)
+        while idx + 8 < n:
+            if raw_bytes[idx] != 0xFF:
+                idx += 1
+                continue
+            while idx < n and raw_bytes[idx] == 0xFF:
+                idx += 1
+            if idx >= n:
+                break
+            marker = raw_bytes[idx]
+            idx += 1
+            if marker in (0xD8, 0xD9) or (0xD0 <= marker <= 0xD7):
+                continue
+            if idx + 2 > n:
+                break
+            seg_len = int.from_bytes(raw_bytes[idx : idx + 2], "big")
+            if seg_len < 2:
+                break
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                if idx + 7 <= n:
+                    h = int.from_bytes(raw_bytes[idx + 3 : idx + 5], "big")
+                    w = int.from_bytes(raw_bytes[idx + 5 : idx + 7], "big")
+                    return (w, h) if w > 0 and h > 0 else None
+                break
+            idx += seg_len
+    return None
+
+
+def is_valid_generated_image_bytes(
+    raw_bytes: Optional[bytes],
+    min_bytes: int = MIN_GENERATED_IMAGE_BYTES,
+    min_dim: int = MIN_GENERATED_IMAGE_DIM,
+) -> bool:
+    """Return True only if raw_bytes is a real generated image (>= 4KB and >= 200x200 px), rejecting 64x64 UI icons."""
+    if not raw_bytes or len(raw_bytes) < min_bytes:
+        return False
+    dims = get_image_dimensions(raw_bytes)
+    if dims is not None:
+        w, h = dims
+        if w < min_dim or h < min_dim:
+            return False
+    return True
+
+
+def is_hermes_client(messages: List[Message]) -> bool:
+    """Detect if the requesting client is Hermes Desktop (supports native MEDIA: file rendering)."""
+    for m in messages:
+        if m.role in ("system", "developer"):
+            txt = get_content_text(m.content)
+            if "MEDIA:" in txt or "Hermes desktop app" in txt:
+                return True
+    return False
+
+
+async def extract_and_save_turn_images(
+    turn_handle: Any,
+    page: Optional[Page] = None,
+    request: Optional[Request] = None,
+    emit_media_directive: bool = False,
+    expect_image: bool = False,
+) -> str:
+    """Extract generated images from the finished DOM turn, save to IMAGE_DIR, and return Markdown/MEDIA links."""
+    extracted: List[Dict[str, Any]] = []
+    max_attempts = 4 if expect_image else 1
+    for attempt in range(max_attempts):
+        try:
+            res = await turn_handle.evaluate(JS_EXTRACT_TURN_IMAGES)
+            if isinstance(res, list) and len(res) > 0:
+                extracted = res
+                break
+        except Exception as e:
+            print(f"  [Debug] Failed to extract generated images from turn (attempt {attempt + 1}): {e}", flush=True)
+        if expect_image and page is not None:
+            try:
+                # Also check document.body in case the portal mounted the generated image card outside .turn
+                body_res = await page.evaluate(f"({JS_EXTRACT_TURN_IMAGES})(document.body)")
+                if isinstance(body_res, list) and len(body_res) > 0:
+                    extracted = [ body_res[-1] ]
+                    break
+            except Exception:
+                pass
+        if attempt + 1 < max_attempts:
+            await asyncio.sleep(0.8)
+
+    base_url = str(request.base_url).rstrip("/") if request is not None else "http://127.0.0.1:8080"
+    md_Blocks = []
+
+    if not extracted and expect_image and page is not None:
+        # Tier 4 Fallback: If 'Image generated by ...' was announced in text but no DOM <img>/<canvas> matched
+        # (e.g. closed Shadow DOM or custom renderer), capture a visual screenshot of the turn's summary/card.
+        try:
+            shot_bytes = await turn_handle.screenshot(type="png", timeout=10000)
+            if shot_bytes and len(shot_bytes) >= 1024:
+                digest = hashlib.sha256(shot_bytes).hexdigest()[:24]
+                fname = f"img_{digest}.png"
+                fpath = IMAGE_DIR / fname
+                if not fpath.exists():
+                    fpath.write_bytes(shot_bytes)
+                img_url = f"{base_url}/v1/images/{fname}"
+                print(f"  🖼️ [Image] Captured turn card fallback screenshot ({len(shot_bytes)} bytes)", flush=True)
+                if emit_media_directive:
+                    return f"MEDIA:{fpath.resolve().as_posix()}"
+                return f"![Generated Image]({img_url})"
+        except Exception as e:
+            print(f"  [Debug] Tier-4 turn screenshot fallback failed: {e}", flush=True)
+        return ""
+
+    if not extracted or not isinstance(extracted, list):
+        return ""
+
+    for idx, item in enumerate(extracted):
+        if not isinstance(item, dict):
+            continue
+        data_url = item.get("dataUrl") or ""
+        src = (item.get("src") or "").strip()
+        extract_id = item.get("extractId") or ""
+        alt = item.get("alt") or f"Generated Image {idx + 1}"
+        raw_bytes: Optional[bytes] = None
+        ext = "png"
+
+        # Tier 1: Direct data:image/... URI returned from in-page JS
+        match = re.match(r"^data:(image/[a-zA-Z0-9.+-]+);base64,(.+)$", data_url)
+        if match:
+            mime_type, b64_data = match.groups()
+            ext = mime_type.split("/")[-1].split("+")[0].lower()
+            try:
+                raw_bytes = base64.b64decode(b64_data)
+            except Exception:
+                raw_bytes = None
+
+        # Tier 2: Playwright browser network request (bypasses CORS while sharing browser session cookies)
+        if not is_valid_generated_image_bytes(raw_bytes) and page is not None and src.startswith(("http://", "https://")):
+            try:
+                resp = await page.context.request.get(src, timeout=15000)
+                if resp.ok:
+                    body = await resp.body()
+                    if is_valid_generated_image_bytes(body):
+                        raw_bytes = body
+                        ct = (resp.headers.get("content-type") or "").lower()
+                        if "jpeg" in ct or "jpg" in ct:
+                            ext = "jpg"
+                        elif "webp" in ct:
+                            ext = "webp"
+                        elif "gif" in ct:
+                            ext = "gif"
+                        else:
+                            ext = "png"
+                        print(f"  🖼️ [Image] Fetched cross-origin image via Playwright request ({len(raw_bytes)} bytes)", flush=True)
+            except Exception as e:
+                print(f"  [Debug] Tier-2 Playwright request fetch failed for {src[:60]}: {e}", flush=True)
+
+        # Tier 3: Playwright compositor element screenshot (pierces Shadow DOM and ignores canvas tainting)
+        if not is_valid_generated_image_bytes(raw_bytes) and page is not None and extract_id:
+            try:
+                loc = page.locator(f'[data-ge-extract-id="{extract_id}"]').first
+                if await loc.count() > 0:
+                    shot_bytes = await loc.screenshot(type="png", timeout=10000)
+                    if is_valid_generated_image_bytes(shot_bytes):
+                        raw_bytes = shot_bytes
+                        ext = "png"
+                        print(f"  🖼️ [Image] Captured image via Playwright element screenshot ({len(raw_bytes)} bytes)", flush=True)
+            except Exception as e:
+                print(f"  [Debug] Tier-3 element screenshot fallback failed for {extract_id}: {e}", flush=True)
+
+        if not is_valid_generated_image_bytes(raw_bytes):
+            print(f"  ⚠️ [Image] Rejected small/invalid media (tag={item.get('tag')}, size={len(raw_bytes) if raw_bytes else 0}, src={src[:60]})", flush=True)
+            continue
+
+        if ext == "jpeg":
+            ext = "jpg"
+        elif ext not in ("png", "jpg", "webp", "gif"):
+            ext = "png"
+        try:
+            digest = hashlib.sha256(raw_bytes).hexdigest()[:24]
+            fname = f"img_{digest}.{ext}"
+            fpath = IMAGE_DIR / fname
+            if not fpath.exists():
+                fpath.write_bytes(raw_bytes)
+            img_url = f"{base_url}/v1/images/{fname}"
+            if emit_media_directive:
+                md_Blocks.append(f"MEDIA:{fpath.resolve().as_posix()}")
+            else:
+                md_Blocks.append(f"![{alt}]({img_url})")
+        except Exception as e:
+            print(f"  [Debug] Error saving extracted image: {e}", flush=True)
+
+    return "\n\n".join(md_Blocks)
+
+
 async def send_to_gemini(
     session_id: str,
     page: Page,
@@ -1595,7 +2388,8 @@ async def send_to_gemini(
     model: Optional[str] = None,
     images: Optional[List[Tuple[str, bytes]]] = None,
     request: Optional[Request] = None,
-    timeout: int = 180,
+    emit_media_directive: bool = False,
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
 ) -> str:
     if model:
         await switch_model(page, model)
@@ -1605,14 +2399,19 @@ async def send_to_gemini(
 
     response_text = None
     start_time = time.monotonic()
-    previous_text = ""
+    previous_state_key = ""
     first_content_at: Optional[float] = None
     last_text_change_at: Optional[float] = None
     last_active_work_at: Optional[float] = None
     has_seen_generation_start = False
     has_seen_active_work = False
 
+    consecutive_poll_errors = 0
     while (time.monotonic() - start_time) < timeout:
+        if not is_ready or context is None or page.is_closed():
+            dirty_sessions.add(session_id)
+            raise HTTPException(status_code=503, detail="Browser session closed or server shutting down.")
+
         if request is not None and await request.is_disconnected():
             print(f"🛑 [Abort] Client disconnected during non-streaming turn on {session_id[-8:]}", flush=True)
             await stop_active_generation(page)
@@ -1620,6 +2419,7 @@ async def send_to_gemini(
 
         try:
             response_divs = await page.query_selector_all(".turn")
+            consecutive_poll_errors = 0
             current_count = len(response_divs)
 
             if current_count > response_count_before:
@@ -1629,13 +2429,17 @@ async def send_to_gemini(
                 is_generating = state.get("isGenerating", False)
                 has_active_work = state.get("hasActiveWork", False)
                 raw_turn_text = state.get("text", "")
+                image_count = state.get("imageCount", 0)
+                image_sig = state.get("imageSignature", "")
                 is_pending_section = has_pending_section_marker(raw_turn_text)
                 current_text = clean_response_text(raw_turn_text)
+                has_content = bool(current_text) or image_count > 0
                 now = time.monotonic()
-                text_changed = current_text != previous_text
-                previous_text = current_text
+                state_key = f"{current_text}||{image_sig}"
+                text_changed = state_key != previous_state_key
+                previous_state_key = state_key
 
-                if current_text and first_content_at is None:
+                if has_content and first_content_at is None:
                     first_content_at = now
                 if text_changed:
                     last_text_change_at = now
@@ -1643,12 +2447,12 @@ async def send_to_gemini(
                     has_seen_active_work = True
                     last_active_work_at = now
 
-                if current_text or is_generating or has_active_work or is_pending_section:
+                if has_content or is_generating or has_active_work or is_pending_section:
                     has_seen_generation_start = True
 
                 if (
                     has_seen_generation_start
-                    and current_text
+                    and has_content
                     and not is_generating
                     and not has_active_work
                     and first_content_at is not None
@@ -1656,8 +2460,14 @@ async def send_to_gemini(
                 ):
                     grace_seconds = (
                         INTERMEDIATE_STATUS_GRACE_SECONDS
-                        if (is_intermediate_status(current_text) or is_pending_section) and not has_seen_active_work
-                        else INITIAL_RESPONSE_GRACE_SECONDS
+                        if (is_intermediate_status(current_text) or is_pending_section)
+                        and not has_seen_active_work
+                        and image_count == 0
+                        else (
+                            max(INITIAL_RESPONSE_GRACE_SECONDS, 6.0)
+                            if IMAGE_CAPTION_ANNOUNCE_RE.search(current_text) and image_count == 0
+                            else INITIAL_RESPONSE_GRACE_SECONDS
+                        )
                     )
                     quiet_since = max(
                         last_text_change_at,
@@ -1667,9 +2477,30 @@ async def send_to_gemini(
                         now - first_content_at >= grace_seconds
                         and now - quiet_since >= FINAL_RESPONSE_QUIET_SECONDS
                     ):
-                        response_text = current_text
+                        img_md = ""
+                        caption_announces_image = bool(IMAGE_CAPTION_ANNOUNCE_RE.search(current_text))
+                        if image_count > 0 or caption_announces_image:
+                            img_md = await extract_and_save_turn_images(
+                                last_turn,
+                                page=page,
+                                request=request,
+                                emit_media_directive=emit_media_directive,
+                                expect_image=caption_announces_image,
+                            )
+                        if current_text and img_md:
+                            response_text = f"{current_text}\n\n{img_md}"
+                        else:
+                            response_text = current_text or img_md
                         break
+        except asyncio.CancelledError:
+            dirty_sessions.add(session_id)
+            raise
         except Exception as e:
+            consecutive_poll_errors += 1
+            if is_browser_closed_error(e) or not is_ready or context is None or page.is_closed() or consecutive_poll_errors >= 5:
+                dirty_sessions.add(session_id)
+                print(f"🛑 [Abort] Browser connection closed during polling on {session_id[-8:]}: {e}", flush=True)
+                raise HTTPException(status_code=503, detail="Browser connection closed during generation.")
             print(f"  [Debug] Error polling response: {e}", flush=True)
 
         await asyncio.sleep(0.35)
@@ -1715,13 +2546,14 @@ async def stream_from_gemini(
     initial_hashes: List[str],
     images: Optional[List[Tuple[str, bytes]]] = None,
     include_usage: bool = False,
-    timeout: int = 180,
+    timeout: int = REQUEST_TIMEOUT_SECONDS,
 ):
     """Yield an OpenAI-compatible incremental SSE stream with real-time delta chunks and tool-call holdback."""
     completion_id = f"chatcmpl-{int(time.time() * 1000)}"
     created = int(time.time())
     model = req.model
     tools = req.tools if req.tool_choice != "none" else None
+    emit_media = is_hermes_client(req.messages)
 
     def event(
         delta: Dict[str, Any],
@@ -1773,7 +2605,7 @@ async def stream_from_gemini(
             return
 
         start_time = time.monotonic()
-        previous_text = ""
+        previous_state_key = ""
         emitted_text = ""
         role_announced = False
         first_content_at: Optional[float] = None
@@ -1783,7 +2615,13 @@ async def stream_from_gemini(
         has_seen_generation_start = False
         has_seen_active_work = False
 
+        consecutive_poll_errors = 0
         while (time.monotonic() - start_time) < timeout:
+            if not is_ready or context is None or page.is_closed():
+                dirty_sessions.add(session_id)
+                print(f"🛑 [Stream Abort] Browser session closed or server shutting down on {session_id[-8:]}.", flush=True)
+                return
+
             if await request.is_disconnected():
                 print(f"🛑 [Stream Abort] Client disconnected on {session_id[-8:]}; stopping browser generation.", flush=True)
                 await stop_active_generation(page)
@@ -1791,6 +2629,7 @@ async def stream_from_gemini(
 
             try:
                 response_divs = await page.query_selector_all(".turn")
+                consecutive_poll_errors = 0
                 current_count = len(response_divs)
 
                 if current_count > response_count_before:
@@ -1800,13 +2639,17 @@ async def stream_from_gemini(
                     is_generating = state.get("isGenerating", False)
                     has_active_work = state.get("hasActiveWork", False)
                     raw_turn_text = state.get("text", "")
+                    image_count = state.get("imageCount", 0)
+                    image_sig = state.get("imageSignature", "")
                     is_pending_section = has_pending_section_marker(raw_turn_text)
                     current_text = clean_response_text(raw_turn_text)
+                    has_content = bool(current_text) or image_count > 0
                     now = time.monotonic()
-                    text_changed = current_text != previous_text
-                    previous_text = current_text
+                    state_key = f"{current_text}||{image_sig}"
+                    text_changed = state_key != previous_state_key
+                    previous_state_key = state_key
 
-                    if current_text and first_content_at is None:
+                    if has_content and first_content_at is None:
                         first_content_at = now
                     if text_changed:
                         last_text_change_at = now
@@ -1814,7 +2657,7 @@ async def stream_from_gemini(
                         has_seen_active_work = True
                         last_active_work_at = now
 
-                    if current_text or is_generating or has_active_work or is_pending_section:
+                    if has_content or is_generating or has_active_work or is_pending_section:
                         has_seen_generation_start = True
 
                     if (
@@ -1859,7 +2702,7 @@ async def stream_from_gemini(
                     # Check completion criteria
                     if (
                         has_seen_generation_start
-                        and current_text
+                        and has_content
                         and not is_generating
                         and not has_active_work
                         and first_content_at is not None
@@ -1867,8 +2710,14 @@ async def stream_from_gemini(
                     ):
                         grace_seconds = (
                             INTERMEDIATE_STATUS_GRACE_SECONDS
-                            if (is_intermediate_status(current_text) or is_pending_section) and not has_seen_active_work
-                            else INITIAL_RESPONSE_GRACE_SECONDS
+                            if (is_intermediate_status(current_text) or is_pending_section)
+                            and not has_seen_active_work
+                            and image_count == 0
+                            else (
+                                max(INITIAL_RESPONSE_GRACE_SECONDS, 6.0)
+                                if IMAGE_CAPTION_ANNOUNCE_RE.search(current_text) and image_count == 0
+                                else INITIAL_RESPONSE_GRACE_SECONDS
+                            )
                         )
                         quiet_since = max(
                             last_text_change_at,
@@ -1882,10 +2731,24 @@ async def stream_from_gemini(
                                 yield event({"role": "assistant", "content": ""})
                                 role_announced = True
 
+                            img_md = ""
+                            caption_announces_image = bool(IMAGE_CAPTION_ANNOUNCE_RE.search(current_text))
+                            if image_count > 0 or caption_announces_image:
+                                img_md = await extract_and_save_turn_images(
+                                    last_turn,
+                                    page=page,
+                                    request=request,
+                                    emit_media_directive=emit_media,
+                                    expect_image=caption_announces_image,
+                                )
+
                             tool_calls = None
                             clean_text = current_text
-                            if tools:
+                            if tools and current_text:
                                 clean_text, tool_calls = parse_tool_calls(current_text, allowed_tools=tools)
+
+                            if img_md:
+                                clean_text = f"{clean_text}\n\n{img_md}" if clean_text else img_md
 
                             # Create the final assistant message and update history hashes
                             final_assistant_msg = Message(role="assistant", content=clean_text, tool_calls=tool_calls)
@@ -1937,7 +2800,20 @@ async def stream_from_gemini(
                             yield "data: [DONE]\n\n"
                             return
 
+            except asyncio.CancelledError:
+                dirty_sessions.add(session_id)
+                return
             except Exception as e:
+                consecutive_poll_errors += 1
+                if is_browser_closed_error(e) or not is_ready or context is None or page.is_closed() or consecutive_poll_errors >= 5:
+                    dirty_sessions.add(session_id)
+                    print(f"🛑 [Stream Abort] Browser connection closed on {session_id[-8:]}: {e}", flush=True)
+                    if not role_announced:
+                        yield event({"role": "assistant", "content": ""})
+                    yield event({"content": "\n\n[Gateway Error: Browser session closed or server shutting down.]"})
+                    yield event({}, finish_reason="stop")
+                    yield "data: [DONE]\n\n"
+                    return
                 print(f"  [Debug] Error polling stream: {e}", flush=True)
 
             now = time.monotonic()
@@ -1986,6 +2862,18 @@ async def reset_sessions(session_id: Optional[str] = None):
     session_tools_hashes.clear()
     dirty_sessions.clear()
     return {"status": "all_sessions_cleared"}
+
+
+@app.get("/v1/images/{filename}")
+async def get_generated_image(filename: str):
+    """Serve cached generated images (unauthenticated so Markdown <img> tags render directly)."""
+    safe_name = Path(filename).name
+    if not safe_name or safe_name != filename or not safe_name.startswith("img_"):
+        raise HTTPException(status_code=404, detail="Image not found")
+    fpath = IMAGE_DIR / safe_name
+    if not fpath.is_file():
+        raise HTTPException(status_code=404, detail="Image not found")
+    return FileResponse(fpath)
 
 
 @app.get("/v1/models", dependencies=[Depends(verify_api_key)])
@@ -2134,6 +3022,7 @@ async def chat_completions(req: ChatRequest, request: Request):
             model=req.model,
             images=images,
             request=request,
+            emit_media_directive=is_hermes_client(req.messages),
         )
 
         tool_calls = None
@@ -2190,4 +3079,4 @@ if __name__ == "__main__":
     default_host = "0.0.0.0" if API_KEY else "127.0.0.1"
     host = os.getenv("HOST", default_host)
     port = int(os.getenv("PORT", "8080"))
-    uvicorn.run(app, host=host, port=port)
+    uvicorn.run(app, host=host, port=port, timeout_graceful_shutdown=3)

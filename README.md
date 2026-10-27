@@ -13,7 +13,7 @@ An OpenAI-compatible local API gateway for **Gemini Enterprise / Vertex AI Agent
 - **Resilient Tool Calling**: Translates OpenAI JSON Schema tool definitions into a structured `<tool_call>` XML protocol and parses single or parallel tool invocations back into standard OpenAI `tool_calls` payloads.
 - **Deep Shadow-DOM Markdown Extractor**: Pierces nested `ucs-*` shadow roots to reconstruct clean GitHub-Flavored Markdown (fenced code blocks with language detection, inline code, tables, nested lists, headings, blockquotes, and links) while stripping portal UI noise (`[[section:...]]`, `suggested_questions`, `<a2a_datapart_json>`, skill badges, and progress spinners).
 - **Multi-Tab Session Pool & Delta Sync**: Tracks conversation history hashes per session. Append-only follow-up turns send **only the delta messages** to the existing browser tab (`DELTA` mode), while history edits/branches automatically reset the tab (`RESET+FULL` mode). Idle tabs are automatically evicted via TTL and LRU limits.
-- **Multimodal & File Attachments**: Supports base64 `image_url` uploads via browser file input and inline base64 document/file decoding.
+- **Multimodal & Generated Image Support**: Supports base64 `image_url` uploads via browser file input, inline base64 document/file decoding, and automatic extraction of assistant-generated images from the Gemini DOM (served via `GET /v1/images/{filename}` or native Hermes `MEDIA:` paths).
 - **Configurable Portal URL & Bearer Auth**: Easily configure `TARGET_URL` and `API_KEY` via your local `config.properties`.
 - **Client Disconnect Abort**: Automatically clicks the Gemini UI Stop button if the HTTP client disconnects mid-generation.
 
@@ -110,6 +110,7 @@ For reliable local tool execution (`read_file`, `write_file`, `terminal`, etc.),
 | :--- | :--- | :--- | :--- |
 | `GET` | `/health` | No | Returns gateway readiness (`ready` / `initializing`), `version` (`1.0.0`), active/dirty session counts, and `available_models`. |
 | `GET` | `/v1/models` | Bearer | Returns the OpenAI-compatible model list dynamically fetched from the Gemini web UI. |
+| `GET` | `/v1/images/{filename}` | No | Serves cached assistant-generated images extracted from the Gemini web UI. |
 | `POST` | `/v1/chat/completions` | Bearer | OpenAI Chat Completions endpoint supporting `stream: true/false`, `tools`, `tool_choice`, `stream_options.include_usage`, multimodal `image_url`, and session tracking. |
 | `POST` | `/v1/sessions/reset` | Bearer | Resets a specific session (`?session_id=...`) or closes and clears all active browser tabs when omitted. |
 
