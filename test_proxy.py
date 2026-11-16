@@ -33,6 +33,8 @@ from server import (
     is_dedicated_title_request,
 )
 from local_router import classify_local_request
+from guardrails import CircuitBreaker, TokenBucketRateLimiter
+from tool_validator import validate_and_normalize_tool_calls
 
 PROXY_BASE_URL = os.getenv("PROXY_BASE_URL", "http://127.0.0.1:8080")
 API_KEY = server.API_KEY or ""
@@ -285,6 +287,69 @@ class TestProxyUnitLogic(unittest.TestCase):
         self.assertIsNone(
             classify_local_request(req_with_tools, get_content_text, server.estimate_tokens)
         )
+
+    def test_circuit_breaker_lifecycle(self):
+        from fastapi import HTTPException
+
+        cb = CircuitBreaker(threshold=2, cooldown_sec=60)
+        cb.before_request()
+        cb.record_failure("timeout 1", immediate_open=False)
+        self.assertEqual(cb.state, "CLOSED")
+        cb.record_failure("timeout 2", immediate_open=False)
+        self.assertEqual(cb.state, "OPEN")
+        with self.assertRaises(HTTPException) as ctx:
+            cb.before_request()
+        self.assertEqual(ctx.exception.status_code, 503)
+        cb._opened_at -= 61
+        cb.before_request()
+        self.assertEqual(cb.state, "HALF_OPEN")
+        cb.record_success()
+        self.assertEqual(cb.state, "CLOSED")
+
+    def test_tool_validator_coercion_and_missing_required(self):
+        tools = [
+            Tool(
+                function=FunctionDef(
+                    name="read_file",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "limit": {"type": "integer"},
+                            "recursive": {"type": "boolean"},
+                        },
+                        "required": ["path"],
+                    },
+                )
+            )
+        ]
+        # Coerce stringified int and bool
+        tc_ok = [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": json.dumps({"path": "a.py", "limit": "50", "recursive": "true"}),
+                },
+            }
+        ]
+        norm, errs = validate_and_normalize_tool_calls(tc_ok, tools)
+        self.assertEqual(errs, [])
+        parsed_args = json.loads(norm[0]["function"]["arguments"])
+        self.assertEqual(parsed_args["limit"], 50)
+        self.assertIs(parsed_args["recursive"], True)
+
+        # Missing required field
+        tc_bad = [
+            {
+                "id": "call_2",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": json.dumps({"limit": 10})},
+            }
+        ]
+        _, bad_errs = validate_and_normalize_tool_calls(tc_bad, tools)
+        self.assertTrue(any("missing required argument 'path'" in e for e in bad_errs))
 
 
 # ==============================================================================

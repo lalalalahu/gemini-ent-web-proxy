@@ -36,6 +36,12 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 load_dotenv(dotenv_path=PROPERTIES_FILE, override=True)
 
 from local_router import local_router, LOCAL_MODEL_ENABLED, LOCAL_MODEL_NAME
+from guardrails import rate_limiter, circuit_breaker, detect_page_anomaly
+from tool_validator import (
+    TOOL_VALIDATION_MAX_RETRIES,
+    validate_and_normalize_tool_calls,
+    build_tool_repair_prompt,
+)
 
 if LOCAL_MODEL_ENABLED and LOCAL_MODEL_NAME not in AVAILABLE_MODELS:
     AVAILABLE_MODELS.append(LOCAL_MODEL_NAME)
@@ -1609,6 +1615,7 @@ async def send_to_gemini(
         await switch_model(page, model)
 
     dirty_sessions.add(session_id)
+    await rate_limiter.acquire()
     response_count_before = await submit_prompt_to_ui(page, text, images=images)
 
     response_text = None
@@ -1683,9 +1690,16 @@ async def send_to_gemini(
         await asyncio.sleep(0.35)
 
     if not response_text:
+        anomaly = await detect_page_anomaly(page)
+        if anomaly:
+            reason, imm_open = anomaly
+            circuit_breaker.record_failure(reason, immediate_open=imm_open)
+        else:
+            circuit_breaker.record_failure("Gateway timed out waiting for AI response", immediate_open=False)
         await stop_active_generation(page)
         raise HTTPException(status_code=504, detail="Gateway timed out waiting for AI response.")
 
+    circuit_breaker.record_success()
     return response_text
 
 
@@ -1771,9 +1785,16 @@ async def stream_from_gemini(
                 await switch_model(page, model)
 
             dirty_sessions.add(session_id)
+            await rate_limiter.acquire()
             response_count_before = await submit_prompt_to_ui(page, text_to_send, images=images)
         except Exception as e:
             dirty_sessions.add(session_id)
+            anomaly = await detect_page_anomaly(locals().get("page"))
+            if anomaly:
+                reason, imm_open = anomaly
+                circuit_breaker.record_failure(reason, immediate_open=imm_open)
+            else:
+                circuit_breaker.record_failure(f"Stream setup failed: {e}", immediate_open=False)
             print(f"❌ [Stream Init Error] Session {session_id[-8:]} failed during setup: {e}", flush=True)
             yield event({"role": "assistant", "content": f"\n\n[Gateway Error: Failed to prepare browser session: {e}]"})
             yield event({}, finish_reason="stop")
@@ -1890,10 +1911,43 @@ async def stream_from_gemini(
                                 yield event({"role": "assistant", "content": ""})
                                 role_announced = True
 
+                            circuit_breaker.record_success()
                             tool_calls = None
                             clean_text = current_text
                             if tools:
                                 clean_text, tool_calls = parse_tool_calls(current_text, allowed_tools=tools)
+                                tool_calls, val_errors = validate_and_normalize_tool_calls(
+                                    tool_calls, tools, raw_response=current_text
+                                )
+                                if val_errors and TOOL_VALIDATION_MAX_RETRIES > 0:
+                                    for attempt in range(TOOL_VALIDATION_MAX_RETRIES):
+                                        print(
+                                            f"🛠️ [ToolValidator] Stream schema error (retry {attempt + 1}/{TOOL_VALIDATION_MAX_RETRIES}): {val_errors}",
+                                            flush=True,
+                                        )
+                                        try:
+                                            repair_reply = await send_to_gemini(
+                                                session_id=session_id,
+                                                page=page,
+                                                text=build_tool_repair_prompt(val_errors),
+                                                model=None,
+                                                images=None,
+                                                request=request,
+                                                timeout=90,
+                                            )
+                                            r_clean, r_tools = parse_tool_calls(repair_reply, allowed_tools=tools)
+                                            r_tools, r_errors = validate_and_normalize_tool_calls(
+                                                r_tools, tools, raw_response=repair_reply
+                                            )
+                                            if not r_errors and r_tools:
+                                                tool_calls = r_tools
+                                                if r_clean:
+                                                    clean_text = r_clean
+                                                break
+                                            val_errors = r_errors
+                                        except Exception as repair_exc:
+                                            print(f"⚠️ [ToolValidator] Repair retry failed: {repair_exc}", flush=True)
+                                            break
 
                             # Create the final assistant message and update history hashes
                             final_assistant_msg = Message(role="assistant", content=clean_text, tool_calls=tool_calls)
@@ -1955,6 +2009,12 @@ async def stream_from_gemini(
 
             await asyncio.sleep(0.35)
 
+        anomaly = await detect_page_anomaly(page)
+        if anomaly:
+            reason, imm_open = anomaly
+            circuit_breaker.record_failure(reason, immediate_open=imm_open)
+        else:
+            circuit_breaker.record_failure("Gateway timed out waiting for the web response", immediate_open=False)
         await stop_active_generation(page)
         if not role_announced:
             yield event({"role": "assistant", "content": ""})
@@ -1974,6 +2034,8 @@ async def health_check():
         "active_sessions": len(session_pages),
         "dirty_sessions": len(dirty_sessions),
         "available_models": AVAILABLE_MODELS,
+        "rate_limiter": rate_limiter.get_status(),
+        "circuit_breaker": circuit_breaker.get_status(),
     }
 
 
@@ -2039,6 +2101,8 @@ async def chat_completions(req: ChatRequest, request: Request):
             status_code=503, detail="Gateway is initializing or awaiting authentication."
         )
 
+    circuit_breaker.before_request()
+
     session_id = get_session_id(req, request)
     images = extract_images_from_messages(req.messages)
     include_usage = bool(req.stream_options and req.stream_options.get("include_usage"))
@@ -2089,6 +2153,38 @@ async def chat_completions(req: ChatRequest, request: Request):
 
         if req.tools and req.tool_choice != "none":
             clean_text, tool_calls = parse_tool_calls(ai_reply, allowed_tools=req.tools)
+            tool_calls, val_errors = validate_and_normalize_tool_calls(
+                tool_calls, req.tools, raw_response=ai_reply
+            )
+            if val_errors and TOOL_VALIDATION_MAX_RETRIES > 0:
+                for attempt in range(TOOL_VALIDATION_MAX_RETRIES):
+                    print(
+                        f"🛠️ [ToolValidator] Schema error (retry {attempt + 1}/{TOOL_VALIDATION_MAX_RETRIES}): {val_errors}",
+                        flush=True,
+                    )
+                    try:
+                        repair_reply = await send_to_gemini(
+                            session_id=session_id,
+                            page=page,
+                            text=build_tool_repair_prompt(val_errors),
+                            model=None,
+                            images=None,
+                            request=request,
+                            timeout=90,
+                        )
+                        r_clean, r_tools = parse_tool_calls(repair_reply, allowed_tools=req.tools)
+                        r_tools, r_errors = validate_and_normalize_tool_calls(
+                            r_tools, req.tools, raw_response=repair_reply
+                        )
+                        if not r_errors and r_tools:
+                            tool_calls = r_tools
+                            if r_clean:
+                                clean_text = r_clean
+                            break
+                        val_errors = r_errors
+                    except Exception as repair_exc:
+                        print(f"⚠️ [ToolValidator] Repair retry failed: {repair_exc}", flush=True)
+                        break
             if tool_calls:
                 finish_reason = "tool_calls"
                 print(
