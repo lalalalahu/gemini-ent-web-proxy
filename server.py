@@ -42,6 +42,15 @@ from tool_validator import (
     validate_and_normalize_tool_calls,
     build_tool_repair_prompt,
 )
+from net_hook import (
+    NETWORK_HOOK_ENABLED,
+    FAST_NET_SETTLE_SECONDS,
+    DOM_POLL_INTERVAL_SEC,
+    FETCH_HOOK_INIT_SCRIPT,
+    get_net_state,
+    should_fast_exit,
+)
+from tab_pool import warm_tab_pool
 
 if LOCAL_MODEL_ENABLED and LOCAL_MODEL_NAME not in AVAILABLE_MODELS:
     AVAILABLE_MODELS.append(LOCAL_MODEL_NAME)
@@ -438,7 +447,13 @@ JS_STATUS_AND_EXTRACTOR = """(turnEl) => {
         isGenerating: hasStop || hasStopIcon,
         hasActiveWork,
         text: rawText,
-        length: rawText.length
+        length: rawText.length,
+        netState: (typeof window !== 'undefined' && window.__geminiNetState) ? {
+            activeStreams: window.__geminiNetState.activeStreams,
+            totalStreamsStarted: window.__geminiNetState.totalStreamsStarted,
+            totalStreamsEnded: window.__geminiNetState.totalStreamsEnded,
+            lastErrorStatus: window.__geminiNetState.lastErrorStatus
+        } : null
     };
 }"""
 
@@ -1254,6 +1269,9 @@ async def init_browser():
         viewport={"width": 1280, "height": 900},
     )
 
+    if NETWORK_HOOK_ENABLED:
+        await context.add_init_script(FETCH_HOOK_INIT_SCRIPT)
+
     page = await context.new_page()
     await Stealth().apply_stealth_async(page)
     await page.goto(TARGET_URL)
@@ -1303,6 +1321,13 @@ async def init_browser():
     cleanup_task = asyncio.create_task(cleanup_idle_sessions_loop())
 
     is_ready = True
+    warm_tab_pool.schedule_refill(
+        context=context,
+        target_url=TARGET_URL,
+        wait_for_editor_ready=wait_for_editor_ready,
+        active_tab_count_fn=lambda: len(session_pages),
+        max_open_tabs=MAX_OPEN_TABS,
+    )
     print("✅ Service ready! Local gateway is online.")
     print("🎯 API: http://localhost:8080/v1/chat/completions\n")
 
@@ -1313,6 +1338,7 @@ async def shutdown_browser():
     is_ready = False
     if cleanup_task and not cleanup_task.done():
         cleanup_task.cancel()
+    await warm_tab_pool.close_all()
     for sid, page in list(session_pages.items()):
         try:
             if page and not page.is_closed():
@@ -1386,6 +1412,18 @@ async def wait_for_editor_ready(page: Page, timeout_ms: int = 30000) -> bool:
     return False
 
 
+async def _close_stale_page_async(stale_page: Page) -> None:
+    try:
+        await stop_active_generation(stale_page)
+    except Exception:
+        pass
+    try:
+        if not stale_page.is_closed():
+            await stale_page.close()
+    except Exception:
+        pass
+
+
 async def get_or_create_session_page(session_id: str = "default", force_reset: bool = False) -> Page:
     """
     Get or reset the persistent Vertex browser tab for a client conversation.
@@ -1406,25 +1444,30 @@ async def get_or_create_session_page(session_id: str = "default", force_reset: b
             else:
                 print(f"  🔄 Resetting session tab (dirty/rewind): {session_id[-8:]}", flush=True)
 
-            # Always close dirty/unresponsive tab and replace with a clean tab to avoid SPA/stream hangs
+            # Always close dirty/unresponsive tab in background so we can switch to a warm tab immediately
             session_pages.pop(session_id, None)
             dirty_sessions.discard(session_id)
             session_history_hashes.pop(session_id, None)
             session_tools_hashes.pop(session_id, None)
-            try:
-                await stop_active_generation(page)
-            except Exception:
-                pass
-            try:
-                await page.close()
-            except Exception:
-                pass
+            asyncio.create_task(_close_stale_page_async(page))
             page = None
 
         session_pages.pop(session_id, None)
         session_history_hashes.pop(session_id, None)
         session_tools_hashes.pop(session_id, None)
         dirty_sessions.discard(session_id)
+
+        warm_page = await warm_tab_pool.acquire(
+            context=context,
+            target_url=TARGET_URL,
+            wait_for_editor_ready=wait_for_editor_ready,
+            active_tab_count_fn=lambda: len(session_pages),
+            max_open_tabs=MAX_OPEN_TABS,
+        )
+        if warm_page is not None:
+            session_pages[session_id] = warm_page
+            session_last_used[session_id] = time.monotonic()
+            return warm_page
 
         last_err = None
         for attempt in range(1, 3):
@@ -1616,6 +1659,8 @@ async def send_to_gemini(
 
     dirty_sessions.add(session_id)
     await rate_limiter.acquire()
+    net_before = await get_net_state(page)
+    ended_before = int(net_before.get("totalStreamsEnded", 0))
     response_count_before = await submit_prompt_to_ui(page, text, images=images)
 
     response_text = None
@@ -1624,6 +1669,7 @@ async def send_to_gemini(
     first_content_at: Optional[float] = None
     last_text_change_at: Optional[float] = None
     last_active_work_at: Optional[float] = None
+    net_settled_at: Optional[float] = None
     has_seen_generation_start = False
     has_seen_active_work = False
 
@@ -1661,6 +1707,13 @@ async def send_to_gemini(
                 if current_text or is_generating or has_active_work or is_pending_section:
                     has_seen_generation_start = True
 
+                net_state = state.get("netState")
+                if isinstance(net_state, dict) and net_state.get("activeStreams", 0) == 0 and net_state.get("totalStreamsEnded", 0) > ended_before:
+                    if net_settled_at is None:
+                        net_settled_at = now
+                else:
+                    net_settled_at = None
+
                 if (
                     has_seen_generation_start
                     and current_text
@@ -1669,16 +1722,30 @@ async def send_to_gemini(
                     and first_content_at is not None
                     and last_text_change_at is not None
                 ):
+                    interm = is_intermediate_status(current_text)
                     grace_seconds = (
                         INTERMEDIATE_STATUS_GRACE_SECONDS
-                        if (is_intermediate_status(current_text) or is_pending_section) and not has_seen_active_work
+                        if (interm or is_pending_section) and not has_seen_active_work
                         else INITIAL_RESPONSE_GRACE_SECONDS
                     )
                     quiet_since = max(
                         last_text_change_at,
                         last_active_work_at or last_text_change_at,
                     )
-                    if (
+                    fast_done = should_fast_exit(
+                        net_state=net_state,
+                        ended_before=ended_before,
+                        net_settled_at=net_settled_at,
+                        now=now,
+                        quiet_since=quiet_since,
+                        is_generating=is_generating,
+                        has_active_work=has_active_work,
+                        is_pending_section=is_pending_section,
+                        is_intermediate=interm,
+                        current_text=current_text,
+                        has_seen_generation_start=has_seen_generation_start,
+                    )
+                    if fast_done or (
                         now - first_content_at >= grace_seconds
                         and now - quiet_since >= FINAL_RESPONSE_QUIET_SECONDS
                     ):
@@ -1687,7 +1754,7 @@ async def send_to_gemini(
         except Exception as e:
             print(f"  [Debug] Error polling response: {e}", flush=True)
 
-        await asyncio.sleep(0.35)
+        await asyncio.sleep(DOM_POLL_INTERVAL_SEC)
 
     if not response_text:
         anomaly = await detect_page_anomaly(page)
@@ -1786,6 +1853,8 @@ async def stream_from_gemini(
 
             dirty_sessions.add(session_id)
             await rate_limiter.acquire()
+            net_before = await get_net_state(page)
+            ended_before = int(net_before.get("totalStreamsEnded", 0))
             response_count_before = await submit_prompt_to_ui(page, text_to_send, images=images)
         except Exception as e:
             dirty_sessions.add(session_id)
@@ -1808,6 +1877,7 @@ async def stream_from_gemini(
         first_content_at: Optional[float] = None
         last_text_change_at: Optional[float] = None
         last_active_work_at: Optional[float] = None
+        net_settled_at: Optional[float] = None
         last_keepalive_at = start_time
         has_seen_generation_start = False
         has_seen_active_work = False
@@ -1845,6 +1915,13 @@ async def stream_from_gemini(
 
                     if current_text or is_generating or has_active_work or is_pending_section:
                         has_seen_generation_start = True
+
+                    net_state = state.get("netState")
+                    if isinstance(net_state, dict) and net_state.get("activeStreams", 0) == 0 and net_state.get("totalStreamsEnded", 0) > ended_before:
+                        if net_settled_at is None:
+                            net_settled_at = now
+                    else:
+                        net_settled_at = None
 
                     if (
                         current_text
@@ -1894,16 +1971,30 @@ async def stream_from_gemini(
                         and first_content_at is not None
                         and last_text_change_at is not None
                     ):
+                        interm = is_intermediate_status(current_text)
                         grace_seconds = (
                             INTERMEDIATE_STATUS_GRACE_SECONDS
-                            if (is_intermediate_status(current_text) or is_pending_section) and not has_seen_active_work
+                            if (interm or is_pending_section) and not has_seen_active_work
                             else INITIAL_RESPONSE_GRACE_SECONDS
                         )
                         quiet_since = max(
                             last_text_change_at,
                             last_active_work_at or last_text_change_at,
                         )
-                        if (
+                        fast_done = should_fast_exit(
+                            net_state=net_state,
+                            ended_before=ended_before,
+                            net_settled_at=net_settled_at,
+                            now=now,
+                            quiet_since=quiet_since,
+                            is_generating=is_generating,
+                            has_active_work=has_active_work,
+                            is_pending_section=is_pending_section,
+                            is_intermediate=interm,
+                            current_text=current_text,
+                            has_seen_generation_start=has_seen_generation_start,
+                        )
+                        if fast_done or (
                             now - first_content_at >= grace_seconds
                             and now - quiet_since >= FINAL_RESPONSE_QUIET_SECONDS
                         ):
@@ -2007,7 +2098,7 @@ async def stream_from_gemini(
                 yield ": keep-alive\n\n"
                 last_keepalive_at = now
 
-            await asyncio.sleep(0.35)
+            await asyncio.sleep(DOM_POLL_INTERVAL_SEC)
 
         anomaly = await detect_page_anomaly(page)
         if anomaly:
@@ -2036,6 +2127,12 @@ async def health_check():
         "available_models": AVAILABLE_MODELS,
         "rate_limiter": rate_limiter.get_status(),
         "circuit_breaker": circuit_breaker.get_status(),
+        "warm_pool": warm_tab_pool.get_status(),
+        "network_hook": {
+            "enabled": NETWORK_HOOK_ENABLED,
+            "fast_settle_sec": FAST_NET_SETTLE_SECONDS,
+            "poll_interval_sec": DOM_POLL_INTERVAL_SEC,
+        },
     }
 
 

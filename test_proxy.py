@@ -35,6 +35,7 @@ from server import (
 from local_router import classify_local_request
 from guardrails import CircuitBreaker, TokenBucketRateLimiter
 from tool_validator import validate_and_normalize_tool_calls
+from net_hook import has_unclosed_syntax, should_fast_exit
 
 PROXY_BASE_URL = os.getenv("PROXY_BASE_URL", "http://127.0.0.1:8080")
 API_KEY = server.API_KEY or ""
@@ -350,6 +351,37 @@ class TestProxyUnitLogic(unittest.TestCase):
         ]
         _, bad_errs = validate_and_normalize_tool_calls(tc_bad, tools)
         self.assertTrue(any("missing required argument 'path'" in e for e in bad_errs))
+
+    def test_net_hook_conservative_fast_exit_conditions(self):
+        self.assertTrue(has_unclosed_syntax("```python\nprint(1)"))
+        self.assertFalse(has_unclosed_syntax("```python\nprint(1)\n```"))
+        self.assertTrue(has_unclosed_syntax("<tool_call>\n{\"name\": \"read_file\"}"))
+        self.assertFalse(has_unclosed_syntax("<tool_call>\n{\"name\": \"read_file\"}\n</tool_call>"))
+        self.assertTrue(has_unclosed_syntax("| col1 | col2 |\n|---|---|\n| val1"))
+
+        now = 100.0
+        base_kwargs = dict(
+            net_state={"activeStreams": 0, "totalStreamsEnded": 2},
+            ended_before=1,
+            net_settled_at=99.0,
+            now=now,
+            quiet_since=99.0,
+            is_generating=False,
+            has_active_work=False,
+            is_pending_section=False,
+            is_intermediate=False,
+            current_text="All done.",
+            has_seen_generation_start=True,
+            settle_seconds=0.8,
+        )
+        # All 6 conditions satisfied
+        self.assertTrue(should_fast_exit(**base_kwargs))
+        # Active stream -> block fast exit
+        self.assertFalse(should_fast_exit(**{**base_kwargs, "net_state": {"activeStreams": 1, "totalStreamsEnded": 2}}))
+        # Unclosed code fence -> block fast exit
+        self.assertFalse(should_fast_exit(**{**base_kwargs, "current_text": "```python\nx = 1"}))
+        # Settled < 0.8s -> block fast exit
+        self.assertFalse(should_fast_exit(**{**base_kwargs, "quiet_since": 99.5}))
 
 
 # ==============================================================================
