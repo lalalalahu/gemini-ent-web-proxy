@@ -5,3 +5,6 @@ playwright==1.48.0
 playwright-stealth>=2.0.0
 python-dotenv==1.0.1
 markdownify==0.13.1
+huggingface-hub>=0.24.0
+# Optional local lightweight model worker (CPU wheel recommended on Windows):
+# pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu

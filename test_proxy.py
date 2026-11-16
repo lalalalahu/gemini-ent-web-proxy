@@ -32,6 +32,7 @@ from server import (
     extract_images_from_messages,
     is_dedicated_title_request,
 )
+from local_router import classify_local_request
 
 PROXY_BASE_URL = os.getenv("PROXY_BASE_URL", "http://127.0.0.1:8080")
 API_KEY = server.API_KEY or ""
@@ -250,6 +251,40 @@ class TestProxyUnitLogic(unittest.TestCase):
             ]
         )
         self.assertTrue(is_dedicated_title_request(req))
+
+    def test_local_router_classification(self):
+        # 1. Explicit local-fast model
+        req_explicit = ChatRequest(
+            model="local-fast",
+            messages=[Message(role="user", content="Hi")],
+        )
+        self.assertEqual(
+            classify_local_request(req_explicit, get_content_text, server.estimate_tokens),
+            "explicit_model",
+        )
+
+        # 2. Session title request without tools
+        req_title = ChatRequest(
+            model="Auto",
+            messages=[
+                Message(role="system", content="You name chat sessions concisely."),
+                Message(role="user", content="Help me debug FastAPI SSE streaming"),
+            ],
+        )
+        self.assertEqual(
+            classify_local_request(req_title, get_content_text, server.estimate_tokens),
+            "session_title",
+        )
+
+        # 3. Main request with tools must NEVER be routed locally
+        req_with_tools = ChatRequest(
+            model="Auto",
+            messages=[Message(role="user", content="Summarize the following file")],
+            tools=[Tool(function=FunctionDef(name="read_file", parameters={"type": "object"}))],
+        )
+        self.assertIsNone(
+            classify_local_request(req_with_tools, get_content_text, server.estimate_tokens)
+        )
 
 
 # ==============================================================================

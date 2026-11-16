@@ -35,6 +35,11 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 load_dotenv(dotenv_path=PROPERTIES_FILE, override=True)
 
+from local_router import local_router, LOCAL_MODEL_ENABLED, LOCAL_MODEL_NAME
+
+if LOCAL_MODEL_ENABLED and LOCAL_MODEL_NAME not in AVAILABLE_MODELS:
+    AVAILABLE_MODELS.append(LOCAL_MODEL_NAME)
+
 TARGET_URL = os.getenv("TARGET_URL", "https://gemini.google.com")
 API_KEY = os.getenv("API_KEY")
 
@@ -1147,6 +1152,8 @@ async def fetch_available_models(page: Page):
                         fetched_models.append(model_name)
 
         if fetched_models:
+            if LOCAL_MODEL_ENABLED and LOCAL_MODEL_NAME not in fetched_models:
+                fetched_models.append(LOCAL_MODEL_NAME)
             AVAILABLE_MODELS = fetched_models
             print(f"  [Debug] Successfully fetched models: {AVAILABLE_MODELS}", flush=True)
         else:
@@ -1327,6 +1334,7 @@ async def lifespan(app: FastAPI):
     yield
     if not task.done():
         task.cancel()
+    await local_router.shutdown()
     await shutdown_browser()
 
 
@@ -1997,7 +2005,7 @@ async def list_models():
                 "id": m,
                 "object": "model",
                 "created": int(time.time()),
-                "owned_by": "google",
+                "owned_by": "local" if (LOCAL_MODEL_ENABLED and m == LOCAL_MODEL_NAME) else "google",
             }
             for m in AVAILABLE_MODELS
         ],
@@ -2022,70 +2030,9 @@ def is_dedicated_title_request(req: ChatRequest) -> bool:
 
 @app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
 async def chat_completions(req: ChatRequest, request: Request):
-    is_title_request = is_dedicated_title_request(req)
-
-    if is_title_request:
-        print("🏷️ [Intercepted] Title generator detected. Returning instant title.", flush=True)
-        title_json = '{"title": "Gemini Session"}'
-
-        if req.stream:
-            async def stream_title():
-                completion_id = f"chatcmpl-title-{int(time.time() * 1000)}"
-                created = int(time.time())
-                chunk1 = {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": req.model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"role": "assistant", "content": title_json},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
-                yield f"data: {json.dumps(chunk1)}\n\n"
-                chunk2 = {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": req.model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": "stop",
-                        }
-                    ],
-                }
-                yield f"data: {json.dumps(chunk2)}\n\n"
-                yield "data: [DONE]\n\n"
-
-            return StreamingResponse(
-                stream_title(),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                },
-            )
-        else:
-            return {
-                "id": f"chatcmpl-title-{int(time.time() * 1000)}",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": req.model,
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": title_json},
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
-            }
+    local_response = await local_router.handle_if_local(req, get_content_text, estimate_tokens)
+    if local_response is not None:
+        return local_response
 
     if not is_ready:
         raise HTTPException(

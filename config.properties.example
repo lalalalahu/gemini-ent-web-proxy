@@ -3,3 +3,12 @@ TARGET_URL=https://gemini.google.com
 
 # Optional Bearer API Key for /v1/* endpoints (leave empty for no auth on 127.0.0.1)
 API_KEY=
+
+# Local Lightweight GGUF Worker (on-demand load + auto-unload for titles & small tasks)
+LOCAL_MODEL_ENABLED=true
+LOCAL_MODEL_NAME=local-fast
+LOCAL_MODEL_REPO=Qwen/Qwen2.5-0.5B-Instruct-GGUF
+LOCAL_MODEL_FILE=qwen2.5-0.5b-instruct-q4_k_m.gguf
+LOCAL_IDLE_TTL_SECONDS=60
+LOCAL_N_CTX=4096
+LOCAL_N_THREADS=0
