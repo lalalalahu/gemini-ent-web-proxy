@@ -150,9 +150,7 @@ class TestProxyUnitLogic(unittest.TestCase):
             "```"
         )
         _, tool_calls = parse_tool_calls(hallucinated, allowed_tools=tools)
-        # Record whether primary XML parser enforces allowed_tools:
-        if tool_calls:
-            print(f"\n  [Finding] Primary XML tool parser does not filter against allowed_tools: {tool_calls[0]['function']['name']}")
+        self.assertIsNone(tool_calls)
 
     def test_parse_tool_calls_ignores_non_tool_code_blocks(self):
         tools = [Tool(function=FunctionDef(name="read_file"))]
@@ -382,6 +380,28 @@ class TestProxyUnitLogic(unittest.TestCase):
         self.assertFalse(should_fast_exit(**{**base_kwargs, "current_text": "```python\nx = 1"}))
         # Settled < 0.8s -> block fast exit
         self.assertFalse(should_fast_exit(**{**base_kwargs, "quiet_since": 99.5}))
+
+    def test_tool_choice_required_and_forced_function_and_token_estimator(self):
+        tools = [
+            Tool(function=FunctionDef(name="read_file", parameters={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]})),
+            Tool(function=FunctionDef(name="write_file", parameters={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]})),
+        ]
+        # tool_choice='required' with no tool_calls -> error
+        _, errs_req = validate_and_normalize_tool_calls(None, tools, raw_response="Just prose.", tool_choice="required")
+        self.assertTrue(any("required" in e for e in errs_req))
+
+        # tool_choice forcing 'write_file' when 'read_file' was called -> error
+        tc_read = [{"id": "1", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "a.py"}'}}]
+        _, errs_forced = validate_and_normalize_tool_calls(
+            tc_read, tools, tool_choice={"type": "function", "function": {"name": "write_file"}}
+        )
+        self.assertTrue(any("write_file" in e for e in errs_forced))
+
+        # Weighted token estimator: CJK should weigh more per char than ASCII
+        cjk_toks = server.estimate_tokens("你好世界測試")
+        ascii_toks = server.estimate_tokens("hello world test")
+        self.assertGreaterEqual(cjk_toks, 4)
+        self.assertGreaterEqual(ascii_toks, 4)
 
 
 # ==============================================================================

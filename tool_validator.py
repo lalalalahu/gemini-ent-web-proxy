@@ -91,13 +91,18 @@ def validate_and_normalize_tool_calls(
     tool_calls: Optional[List[Dict[str, Any]]],
     allowed_tools: Optional[List[Any]],
     raw_response: str = "",
+    tool_choice: Optional[Any] = None,
 ) -> Tuple[Optional[List[Dict[str, Any]]], List[str]]:
     """
     Normalize unambiguously coerced arguments and validate against OpenAI tool JSON Schemas.
     Returns (normalized_tool_calls, validation_errors).
     """
-    if not allowed_tools:
+    if not allowed_tools or tool_choice == "none":
         return tool_calls, []
+
+    forced_name: Optional[str] = None
+    if isinstance(tool_choice, dict):
+        forced_name = (tool_choice.get("function") or {}).get("name") or tool_choice.get("name")
 
     schema_map: Dict[str, Dict[str, Any]] = {}
     for t in allowed_tools:
@@ -110,6 +115,10 @@ def validate_and_normalize_tool_calls(
             return None, [
                 "A <tool_call> block was emitted, but it could not be parsed as valid JSON with 'name' and 'arguments'."
             ]
+        if forced_name:
+            return None, [f"tool_choice requires calling '{forced_name}', but no tool call was emitted."]
+        if tool_choice == "required":
+            return None, ["tool_choice is 'required', but no tool call was emitted."]
         return None, []
 
     errors: List[str] = []
@@ -170,6 +179,9 @@ def validate_and_normalize_tool_calls(
         updated_fn["arguments"] = json.dumps(args, ensure_ascii=False)
         updated_tc["function"] = updated_fn
         normalized.append(updated_tc)
+
+    if forced_name and not any((tc.get("function") or {}).get("name") == forced_name for tc in normalized):
+        errors.append(f"tool_choice requires calling '{forced_name}'.")
 
     return normalized, errors
 

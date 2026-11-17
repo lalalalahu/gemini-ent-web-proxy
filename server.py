@@ -100,6 +100,11 @@ session_history_hashes: Dict[str, List[str]] = {}
 session_tools_hashes: Dict[str, str] = {}
 dirty_sessions: Set[str] = set()
 session_last_used: Dict[str, float] = {}
+runtime_stats: Dict[str, int] = {
+    "gemini_requests": 0,
+    "local_routed_requests": 0,
+    "auto_retries": 0,
+}
 is_ready = False
 
 MAX_OPEN_TABS = int(os.getenv("MAX_OPEN_TABS", "10"))
@@ -248,6 +253,7 @@ JS_STATUS_AND_EXTRACTOR = """(turnEl) => {
 
             // Skip controls, icons, and progress noise
             if (cls.includes('working-on-it-footer') || cls.includes('working-on-it-spark') || tag === 'ucs-lottie-animation') return '';
+            if (tag === 'ucs-turn-error-banner' || node.getAttribute('slot') === 'turn-error' || role === 'alert' || cls.includes('error-banner')) return '';
             if (['svg', 'button', 'menu', 'md-menu', 'md-icon', 'img', 'style', 'script'].includes(tag) || tag.includes('button') || tag.includes('chip')) return '';
             if (role === 'progressbar') return '';
             if (node.getAttribute('aria-hidden') === 'true' || cls.includes('sr-only')) return '';
@@ -443,9 +449,48 @@ JS_STATUS_AND_EXTRACTOR = """(turnEl) => {
     );
     const hasActiveWork = busyElements.length > 0;
 
+    const errorBanners = querySelectorAllDeep(
+        turnEl,
+        'ucs-turn-error-banner, [slot="turn-error"], [class*="error-banner"], [role="alert"]'
+    ).filter(el => el.offsetParent !== null || el.getClientRects().length > 0 || (el.shadowRoot && extractPlainText(el.shadowRoot).trim().length > 0));
+    const hasError = errorBanners.length > 0;
+    let errorText = '';
+    if (hasError) {
+        errorText = extractPlainText(errorBanners[0]).replace(/\\s+/g, ' ').trim().slice(0, 200);
+    }
+
+    function isRetryCandidate(el) {
+        if (!el) return false;
+        const visible = el.offsetParent !== null || el.getClientRects().length > 0;
+        if (!visible) return false;
+        const cls = (typeof el.className === 'string' ? el.className : '').toLowerCase();
+        const txt = extractPlainText(el).trim().toLowerCase();
+        const aria = (el.getAttribute('aria-label') || el.getAttribute('data-aria-label') || '').toLowerCase();
+        if (cls.includes('retry') || cls.includes('regenerate')) return true;
+        return /\\b(retry|try again|regenerate)\\b/i.test(txt) || /\\b(retry|try again|regenerate)\\b/i.test(aria);
+    }
+
+    let hasRetryButton = false;
+    if (hasError) {
+        for (const banner of errorBanners) {
+            const btns = querySelectorAllDeep(banner, 'button, [role="button"], md-outlined-button, md-text-button, md-filled-button');
+            if (btns.some(isRetryCandidate)) {
+                hasRetryButton = true;
+                break;
+            }
+        }
+    }
+    if (!hasRetryButton) {
+        const turnBtns = querySelectorAllDeep(turnEl, 'button, [role="button"], md-outlined-button, md-text-button, md-filled-button');
+        hasRetryButton = turnBtns.some(isRetryCandidate);
+    }
+
     return {
         isGenerating: hasStop || hasStopIcon,
         hasActiveWork,
+        hasError,
+        hasRetryButton,
+        errorText,
         text: rawText,
         length: rawText.length,
         netState: (typeof window !== 'undefined' && window.__geminiNetState) ? {
@@ -526,11 +571,16 @@ def sanitize_outgoing_prompt(prompt_text: str) -> str:
     return sanitized
 
 
+CJK_CHAR_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf\u3040-\u30ff\uac00-\ud7af]")
+
+
 def estimate_tokens(text: str) -> int:
-    """Estimate OpenAI token count (~4 chars per token) so IDE context managers don't compact early."""
+    """Weighted token estimator for mixed CJK and ASCII/code text."""
     if not text:
         return 0
-    return max(1, len(text) // 4)
+    cjk_count = len(CJK_CHAR_RE.findall(text))
+    other_count = len(text) - cjk_count
+    return max(1, int(round(cjk_count * 0.65 + other_count / 3.8)))
 
 
 # ==============================================================================
@@ -1042,6 +1092,8 @@ def parse_tool_calls(response: str, allowed_tools: Optional[List[Tool]] = None) 
     ts_ms = int(time.time() * 1000)
     for idx, tc in enumerate(raw_tools):
         name = tc.get("name")
+        if allowed_names is not None and name not in allowed_names:
+            continue
         args = tc.get("arguments", {})
         if isinstance(args, str):
             parsed_args = _try_parse_json_object(args)
@@ -1075,6 +1127,9 @@ def parse_tool_calls(response: str, allowed_tools: Optional[List[Tool]] = None) 
                 },
             }
         )
+
+    if not formatted_tool_calls:
+        return cleaned, None
 
     return cleaned, formatted_tool_calls
 
@@ -1548,13 +1603,85 @@ async def switch_model(page: Page, target_model: str):
 # ==============================================================================
 # FAST PROMPT INSERTION & MULTIMODAL UPLOAD (WITH TURN-BOUNDARY VERIFICATION)
 # ==============================================================================
+TURN_SELECTORS = (
+    ".turn",
+    "ucs-turn",
+    "[data-turn-id]",
+    "[class*='turn-container']",
+)
+
+
+async def find_turn_elements(page: Page) -> List[Any]:
+    """Find conversation turn elements with multi-selector fallback for UI resilience."""
+    for selector in TURN_SELECTORS:
+        try:
+            els = await page.query_selector_all(selector)
+            if els:
+                return els
+        except Exception:
+            pass
+    return []
+
+
+async def click_turn_retry_button(turn_el: Any) -> bool:
+    """Locate and click a visible retry/regenerate button inside turn_el (piercing Shadow DOM)."""
+    try:
+        return bool(
+            await turn_el.evaluate(
+                """(root) => {
+                const visited = new Set();
+                const candidates = [];
+                function collect(node) {
+                    if (!node || visited.has(node)) return;
+                    visited.add(node);
+                    if (node.nodeType === Node.ELEMENT_NODE || node.nodeType === Node.DOCUMENT_FRAGMENT_NODE) {
+                        if (node.querySelectorAll) {
+                            try {
+                                node.querySelectorAll('button, [role="button"], md-outlined-button, md-text-button, md-filled-button').forEach(el => candidates.push(el));
+                            } catch (e) {}
+                        }
+                        if (node.shadowRoot) collect(node.shadowRoot);
+                        if (node.children) {
+                            for (const c of node.children) collect(c);
+                        }
+                    }
+                }
+                function plainText(n) {
+                    if (!n) return '';
+                    if (n.nodeType === Node.TEXT_NODE) return n.textContent || '';
+                    let out = '';
+                    if (n.shadowRoot) out += plainText(n.shadowRoot);
+                    if (n.childNodes) for (const c of n.childNodes) out += plainText(c);
+                    return out;
+                }
+                collect(root);
+                for (const el of candidates) {
+                    const visible = el.offsetParent !== null || el.getClientRects().length > 0;
+                    if (!visible) continue;
+                    const cls = (typeof el.className === 'string' ? el.className : '').toLowerCase();
+                    const txt = plainText(el).trim().toLowerCase();
+                    const aria = (el.getAttribute('aria-label') || el.getAttribute('data-aria-label') || '').toLowerCase();
+                    if (cls.includes('retry') || cls.includes('regenerate') || /\\b(retry|try again|regenerate)\\b/i.test(txt) || /\\b(retry|try again|regenerate)\\b/i.test(aria)) {
+                        const innerBtn = (el.shadowRoot && el.shadowRoot.querySelector('button')) || el;
+                        innerBtn.click();
+                        return true;
+                    }
+                }
+                return false;
+            }"""
+            )
+        )
+    except Exception:
+        return False
+
+
 async def submit_prompt_to_ui(
     page: Page,
     text: str,
     images: Optional[List[Tuple[str, bytes]]] = None,
 ) -> int:
     """Insert text via synthetic ClipboardEvent (with fallback), submit, and verify turn start."""
-    existing_responses = await page.query_selector_all(".turn")
+    existing_responses = await find_turn_elements(page)
     response_count_before = len(existing_responses)
 
     if images:
@@ -1672,6 +1799,7 @@ async def send_to_gemini(
     net_settled_at: Optional[float] = None
     has_seen_generation_start = False
     has_seen_active_work = False
+    retry_attempts = 0
 
     while (time.monotonic() - start_time) < timeout:
         if request is not None and await request.is_disconnected():
@@ -1680,7 +1808,7 @@ async def send_to_gemini(
             raise HTTPException(status_code=499, detail="Client disconnected.")
 
         try:
-            response_divs = await page.query_selector_all(".turn")
+            response_divs = await find_turn_elements(page)
             current_count = len(response_divs)
 
             if current_count > response_count_before:
@@ -1689,9 +1817,34 @@ async def send_to_gemini(
 
                 is_generating = state.get("isGenerating", False)
                 has_active_work = state.get("hasActiveWork", False)
+                has_error = state.get("hasError", False)
+                has_retry_btn = state.get("hasRetryButton", False)
+                error_text = state.get("errorText", "")
                 raw_turn_text = state.get("text", "")
                 is_pending_section = has_pending_section_marker(raw_turn_text)
                 current_text = clean_response_text(raw_turn_text)
+
+                if has_error and not is_generating and not has_active_work:
+                    if has_retry_btn and retry_attempts < 1 and not current_text:
+                        clicked = await click_turn_retry_button(last_turn)
+                        if clicked:
+                            retry_attempts += 1
+                            runtime_stats["auto_retries"] += 1
+                            print(f"🔄 [AutoRetry] Error banner detected ({error_text or 'portal error'}); clicked Retry (1/1) on {session_id[-8:]}", flush=True)
+                            net_after = await get_net_state(page)
+                            ended_before = int(net_after.get("totalStreamsEnded", ended_before))
+                            previous_text = ""
+                            first_content_at = None
+                            last_text_change_at = None
+                            last_active_work_at = None
+                            net_settled_at = None
+                            has_seen_generation_start = False
+                            has_seen_active_work = False
+                            await asyncio.sleep(0.5)
+                            continue
+                    dirty_sessions.add(session_id)
+                    circuit_breaker.record_failure(f"Portal turn error: {error_text or 'unknown error'}", immediate_open=False)
+                    raise HTTPException(status_code=502, detail=f"Gemini portal turn error: {error_text or 'Generation failed'}")
                 now = time.monotonic()
                 text_changed = current_text != previous_text
                 previous_text = current_text
@@ -1881,6 +2034,7 @@ async def stream_from_gemini(
         last_keepalive_at = start_time
         has_seen_generation_start = False
         has_seen_active_work = False
+        retry_attempts = 0
 
         while (time.monotonic() - start_time) < timeout:
             if await request.is_disconnected():
@@ -1889,7 +2043,7 @@ async def stream_from_gemini(
                 return
 
             try:
-                response_divs = await page.query_selector_all(".turn")
+                response_divs = await find_turn_elements(page)
                 current_count = len(response_divs)
 
                 if current_count > response_count_before:
@@ -1898,9 +2052,39 @@ async def stream_from_gemini(
 
                     is_generating = state.get("isGenerating", False)
                     has_active_work = state.get("hasActiveWork", False)
+                    has_error = state.get("hasError", False)
+                    has_retry_btn = state.get("hasRetryButton", False)
+                    error_text = state.get("errorText", "")
                     raw_turn_text = state.get("text", "")
                     is_pending_section = has_pending_section_marker(raw_turn_text)
                     current_text = clean_response_text(raw_turn_text)
+
+                    if has_error and not is_generating and not has_active_work:
+                        if has_retry_btn and retry_attempts < 1 and not emitted_text:
+                            clicked = await click_turn_retry_button(last_turn)
+                            if clicked:
+                                retry_attempts += 1
+                                runtime_stats["auto_retries"] += 1
+                                print(f"🔄 [AutoRetry] Stream error banner detected ({error_text or 'portal error'}); clicked Retry (1/1) on {session_id[-8:]}", flush=True)
+                                net_after = await get_net_state(page)
+                                ended_before = int(net_after.get("totalStreamsEnded", ended_before))
+                                previous_text = ""
+                                first_content_at = None
+                                last_text_change_at = None
+                                last_active_work_at = None
+                                net_settled_at = None
+                                has_seen_generation_start = False
+                                has_seen_active_work = False
+                                await asyncio.sleep(0.5)
+                                continue
+                        dirty_sessions.add(session_id)
+                        circuit_breaker.record_failure(f"Portal turn error: {error_text or 'unknown error'}", immediate_open=False)
+                        if not role_announced:
+                            yield event({"role": "assistant", "content": ""})
+                        yield event({"content": f"\n\n[Gateway Error: Gemini portal returned an error banner: {error_text or 'Generation failed'}]"})
+                        yield event({}, finish_reason="stop")
+                        yield "data: [DONE]\n\n"
+                        return
                     now = time.monotonic()
                     text_changed = current_text != previous_text
                     previous_text = current_text
@@ -2008,7 +2192,7 @@ async def stream_from_gemini(
                             if tools:
                                 clean_text, tool_calls = parse_tool_calls(current_text, allowed_tools=tools)
                                 tool_calls, val_errors = validate_and_normalize_tool_calls(
-                                    tool_calls, tools, raw_response=current_text
+                                    tool_calls, tools, raw_response=current_text, tool_choice=req.tool_choice
                                 )
                                 if val_errors and TOOL_VALIDATION_MAX_RETRIES > 0:
                                     for attempt in range(TOOL_VALIDATION_MAX_RETRIES):
@@ -2028,7 +2212,7 @@ async def stream_from_gemini(
                                             )
                                             r_clean, r_tools = parse_tool_calls(repair_reply, allowed_tools=tools)
                                             r_tools, r_errors = validate_and_normalize_tool_calls(
-                                                r_tools, tools, raw_response=repair_reply
+                                                r_tools, tools, raw_response=repair_reply, tool_choice=req.tool_choice
                                             )
                                             if not r_errors and r_tools:
                                                 tool_calls = r_tools
@@ -2133,6 +2317,7 @@ async def health_check():
             "fast_settle_sec": FAST_NET_SETTLE_SECONDS,
             "poll_interval_sec": DOM_POLL_INTERVAL_SEC,
         },
+        "stats": runtime_stats,
     }
 
 
@@ -2191,6 +2376,7 @@ def is_dedicated_title_request(req: ChatRequest) -> bool:
 async def chat_completions(req: ChatRequest, request: Request):
     local_response = await local_router.handle_if_local(req, get_content_text, estimate_tokens)
     if local_response is not None:
+        runtime_stats["local_routed_requests"] += 1
         return local_response
 
     if not is_ready:
@@ -2199,6 +2385,7 @@ async def chat_completions(req: ChatRequest, request: Request):
         )
 
     circuit_breaker.before_request()
+    runtime_stats["gemini_requests"] += 1
 
     session_id = get_session_id(req, request)
     images = extract_images_from_messages(req.messages)
@@ -2251,7 +2438,7 @@ async def chat_completions(req: ChatRequest, request: Request):
         if req.tools and req.tool_choice != "none":
             clean_text, tool_calls = parse_tool_calls(ai_reply, allowed_tools=req.tools)
             tool_calls, val_errors = validate_and_normalize_tool_calls(
-                tool_calls, req.tools, raw_response=ai_reply
+                tool_calls, req.tools, raw_response=ai_reply, tool_choice=req.tool_choice
             )
             if val_errors and TOOL_VALIDATION_MAX_RETRIES > 0:
                 for attempt in range(TOOL_VALIDATION_MAX_RETRIES):
@@ -2271,7 +2458,7 @@ async def chat_completions(req: ChatRequest, request: Request):
                         )
                         r_clean, r_tools = parse_tool_calls(repair_reply, allowed_tools=req.tools)
                         r_tools, r_errors = validate_and_normalize_tool_calls(
-                            r_tools, req.tools, raw_response=repair_reply
+                            r_tools, req.tools, raw_response=repair_reply, tool_choice=req.tool_choice
                         )
                         if not r_errors and r_tools:
                             tool_calls = r_tools
