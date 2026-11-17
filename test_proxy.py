@@ -254,9 +254,9 @@ class TestProxyUnitLogic(unittest.TestCase):
         self.assertTrue(is_dedicated_title_request(req))
 
     def test_local_router_classification(self):
-        # 1. Explicit local-fast model
+        # 1. Explicit local-title model
         req_explicit = ChatRequest(
-            model="local-fast",
+            model="local-title",
             messages=[Message(role="user", content="Hi")],
         )
         self.assertEqual(
@@ -264,11 +264,23 @@ class TestProxyUnitLogic(unittest.TestCase):
             "explicit_model",
         )
 
-        # 2. Session title request without tools
+        # 2. Session title request without tools (including full multi-rule prompt > 500 chars)
+        long_title_sys = (
+            "You name chat sessions. Given the user's opening message, write a title that lets them "
+            "find this conversation again in a list.\nRules:\n- 3 to 7 words, sentence case.\n"
+            "- Name what the user wants DONE, not that they asked a question.\n"
+            "- Keep technical terms, filenames, numbers, and error codes exact.\n"
+            "- Drop filler words: the, this, my, a, an.\n"
+            "- No trailing punctuation, no quotes, no tool names, no 'Title:' prefix.\n"
+            "- Never answer the message. Name it.\n- Always produce something, even for a bare greeting.\n"
+            "- Write the title in the same language as the user's message.\n"
+            'Good: {"title": "Fix login button on mobile"}\n'
+            'Reply with JSON only: {"title": "..."}'
+        )
         req_title = ChatRequest(
             model="Auto",
             messages=[
-                Message(role="system", content="You name chat sessions concisely."),
+                Message(role="system", content=long_title_sys),
                 Message(role="user", content="Help me debug FastAPI SSE streaming"),
             ],
         )
@@ -277,7 +289,16 @@ class TestProxyUnitLogic(unittest.TestCase):
             "session_title",
         )
 
-        # 3. Main request with tools must NEVER be routed locally
+        # 3. Non-title summary request without tools must NOT be intercepted locally
+        req_summary = ChatRequest(
+            model="Auto",
+            messages=[Message(role="user", content="Summarize the following file")],
+        )
+        self.assertIsNone(
+            classify_local_request(req_summary, get_content_text, server.estimate_tokens)
+        )
+
+        # 4. Main request with tools must NEVER be routed locally
         req_with_tools = ChatRequest(
             model="Auto",
             messages=[Message(role="user", content="Summarize the following file")],

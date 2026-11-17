@@ -19,7 +19,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 LOCAL_MODEL_ENABLED: bool = _env_bool("LOCAL_MODEL_ENABLED", True)
-LOCAL_MODEL_NAME: str = os.getenv("LOCAL_MODEL_NAME", "local-fast").strip() or "local-fast"
+LOCAL_MODEL_NAME: str = os.getenv("LOCAL_MODEL_NAME", "local-title").strip() or "local-title"
 LOCAL_MODEL_REPO: str = os.getenv("LOCAL_MODEL_REPO", "Qwen/Qwen2.5-0.5B-Instruct-GGUF").strip()
 LOCAL_MODEL_FILE: str = os.getenv("LOCAL_MODEL_FILE", "qwen2.5-0.5b-instruct-q4_k_m.gguf").strip()
 LOCAL_IDLE_TTL_SECONDS: float = float(os.getenv("LOCAL_IDLE_TTL_SECONDS", "60"))
@@ -31,18 +31,7 @@ WORKER_SCRIPT = Path(__file__).resolve().parent / "local_worker.py"
 
 TITLE_PATTERNS = (
     "you name chat sessions",
-    "generate a title",
-    "generate a short title",
-    "short descriptive title",
-    "chat title",
-    "session title",
-)
-
-LIGHTWEIGHT_SUMMARY_PATTERNS = (
-    "commit message",
-    "generate a concise commit",
-    "one-sentence summary",
-    "summarize the following",
+    'reply with json only: {"title":',
 )
 
 
@@ -78,23 +67,12 @@ def classify_local_request(
     if not messages or _has_non_text_parts(messages):
         return None
 
-    combined_lower = "\n".join(
-        get_content_text(getattr(m, "content", "")).strip().lower()
-        for m in messages
-        if getattr(m, "role", "") in ("system", "developer", "user")
-    )
-    total_tokens = estimate_tokens(combined_lower)
-
     if len(messages) <= 2:
         for m in messages:
             if getattr(m, "role", "") in ("system", "developer"):
                 sys_lower = get_content_text(getattr(m, "content", "")).strip().lower()
-                if len(sys_lower) < 500 and any(p in sys_lower for p in TITLE_PATTERNS):
+                if len(sys_lower) < 2000 and any(p in sys_lower for p in TITLE_PATTERNS):
                     return "session_title"
-
-    if len(messages) <= 3 and total_tokens <= max(512, LOCAL_N_CTX - 512):
-        if any(p in combined_lower for p in LIGHTWEIGHT_SUMMARY_PATTERNS):
-            return "lightweight_summary"
 
     return None
 
@@ -330,8 +308,9 @@ class LocalWorkerManager:
 
         worker_messages = self._build_worker_messages(req, get_content_text)
         prompt_tokens_est = estimate_tokens("\n".join(m["content"] for m in worker_messages))
-        max_tokens = req.max_completion_tokens or req.max_tokens or (96 if route == "session_title" else 512)
-        temperature = 0.2 if route == "session_title" else (req.temperature if req.temperature is not None else 0.3)
+        max_tokens = req.max_completion_tokens or req.max_tokens or (48 if route == "session_title" else 512)
+        temperature = 0.1 if route == "session_title" else (req.temperature if req.temperature is not None else 0.3)
+        response_format = {"type": "json_object"} if route == "session_title" else req.response_format
         req_model = req.model or LOCAL_MODEL_NAME
         include_usage = bool(req.stream_options and req.stream_options.get("include_usage"))
 
@@ -342,7 +321,7 @@ class LocalWorkerManager:
             "messages": worker_messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
-            "response_format": req.response_format,
+            "response_format": response_format,
             "stream": bool(req.stream),
         }
 
@@ -360,6 +339,15 @@ class LocalWorkerManager:
 
             res = await self._run_non_stream(payload)
             content = res.get("content") or ""
+            if route == "session_title":
+                try:
+                    parsed = json.loads(content)
+                    if not isinstance(parsed, dict) or not isinstance(parsed.get("title"), str) or not parsed["title"].strip():
+                        content = '{"title": "Gemini Session"}'
+                    else:
+                        content = json.dumps({"title": parsed["title"].strip()}, ensure_ascii=False)
+                except Exception:
+                    content = '{"title": "Gemini Session"}'
             usage = res.get("usage") or {}
             p_tok = int(usage.get("prompt_tokens") or prompt_tokens_est)
             c_tok = int(usage.get("completion_tokens") or estimate_tokens(content))

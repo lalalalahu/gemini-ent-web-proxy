@@ -6,7 +6,7 @@ API_KEY=
 
 # Local Lightweight GGUF Worker (on-demand load + auto-unload for titles & small tasks)
 LOCAL_MODEL_ENABLED=true
-LOCAL_MODEL_NAME=local-fast
+LOCAL_MODEL_NAME=local-title
 LOCAL_MODEL_REPO=Qwen/Qwen2.5-0.5B-Instruct-GGUF
 LOCAL_MODEL_FILE=qwen2.5-0.5b-instruct-q4_k_m.gguf
 LOCAL_IDLE_TTL_SECONDS=60
